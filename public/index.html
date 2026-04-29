@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Node Field</title>
+    <link rel="stylesheet" href="./styles.css?v=5">
+  </head>
+  <body>
+    <main id="game-shell" aria-label="Node Field">
+      <canvas id="game" aria-label="Strategy game board"></canvas>
+      <section id="home-screen" class="home-screen" aria-label="Game menu">
+        <div class="home-card">
+          <div class="home-brand">
+            <span class="home-mark"></span>
+            <div>
+              <h2>Node Field</h2>
+              <p id="home-status" hidden></p>
+            </div>
+          </div>
+          <div id="mode-actions" class="mode-actions">
+            <button id="singleplayer" class="secondary-action" type="button">Singleplayer</button>
+            <button id="multiplayer" class="primary-action" type="button">Multiplayer</button>
+          </div>
+          <div id="multiplayer-panel" class="multiplayer-panel" hidden>
+            <div class="room-actions">
+              <button id="create-room" class="primary-action" type="button">Create Room</button>
+              <button id="back-menu" class="secondary-action" type="button">Back</button>
+            </div>
+            <label class="room-field" for="room-input">
+              <span>Room or URL</span>
+              <input id="room-input" type="text" inputmode="numeric" autocomplete="off" placeholder="123456">
+            </label>
+            <button id="join-room" class="secondary-action" type="button">Join Room</button>
+            <div id="room-card" class="room-card" hidden>
+              <span>Room</span>
+              <strong id="room-number">000000</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="hud" aria-live="polite">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <div>
+            <h1>Node Field</h1>
+            <p id="status">Board ready</p>
+          </div>
+        </div>
+        <div class="stats" aria-label="Match status">
+          <div>
+            <span>Nodes</span>
+            <strong id="node-score">0 - 0</strong>
+          </div>
+          <div>
+            <span>Units</span>
+            <strong id="unit-score">0 - 0</strong>
+          </div>
+          <div>
+            <span>Selected</span>
+            <strong id="selected-count">0</strong>
+          </div>
+        </div>
+        <button id="restart" type="button" title="Generate a new map">New Map</button>
+        <button id="home" type="button" title="Back to home" hidden>Home</button>
+      </section>
+      <div id="message" hidden></div>
+    </main>
+    <script src="./game.js?v=16"></script>
+  </body>
+</html>
