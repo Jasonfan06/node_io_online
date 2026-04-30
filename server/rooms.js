@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from "ws";
 const ROOM_RE = /^\d{6}$/;
 const EMPTY_ROOM_TTL_MS = 60 * 60 * 1000;
 const ROOM_CLEANUP_INTERVAL_MS = 60_000;
+const SNAPSHOT_RELAY_BUFFER_LIMIT = 256 * 1024;
 
 function safeRoomId(value) {
   const roomId = String(value || "").trim();
@@ -111,6 +112,14 @@ export function createRoomSocketServer(server, { protocol }) {
     const room = rooms.get(client.roomId);
     const peer = room?.[targetRole];
     if (peer) {
+      if (
+        message.type === "snapshot" &&
+        !message.priority &&
+        Number.isFinite(peer.bufferedAmount) &&
+        peer.bufferedAmount > SNAPSHOT_RELAY_BUFFER_LIMIT
+      ) {
+        return;
+      }
       send(peer, message);
     }
   }

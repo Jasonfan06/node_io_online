@@ -34,6 +34,8 @@
   const SERVER_URL = resolveServerUrl();
   const ROOM_PARAM = "room";
   const SNAPSHOT_INTERVAL = 0.08;
+  const SNAPSHOT_BUFFER_LIMIT = 256 * 1024;
+  const SNAPSHOT_TRAIL_POINTS = 2;
   const JOIN_TIMEOUT_MS = 10000;
   const COUNTDOWN_STEP_MS = 800;
   const COUNTDOWN_STEPS = ["3", "2", "1", "Start!"];
@@ -111,6 +113,8 @@
   const state = {
     width: 0,
     height: 0,
+    worldWidth: 0,
+    worldHeight: 0,
     dpr: 1,
     lastTime: performance.now(),
     nodes: [],
@@ -299,18 +303,48 @@
     return state.match.mode === "multi" && localOwner() === OWNER.AI;
   }
 
-  function toViewPoint(x, y) {
-    if (!shouldFlipBoard()) {
-      return { x, y };
-    }
+  function worldWidth() {
+    return Math.max(1, state.worldWidth || state.width);
+  }
+
+  function worldHeight() {
+    return Math.max(1, state.worldHeight || state.height);
+  }
+
+  function viewTransform() {
+    const scale = Math.min(state.width / worldWidth(), state.height / worldHeight());
     return {
-      x: state.width - x,
-      y: state.height - y,
+      scale,
+      offsetX: (state.width - worldWidth() * scale) / 2,
+      offsetY: (state.height - worldHeight() * scale) / 2,
     };
   }
 
+  function toViewPoint(x, y) {
+    const { scale, offsetX, offsetY } = viewTransform();
+    const vx = shouldFlipBoard() ? worldWidth() - x : x;
+    const vy = shouldFlipBoard() ? worldHeight() - y : y;
+    return {
+      x: offsetX + vx * scale,
+      y: offsetY + vy * scale,
+    };
+  }
+
+  function toViewRadius(radius) {
+    return radius * viewTransform().scale;
+  }
+
   function toWorldPoint(x, y) {
-    return toViewPoint(x, y);
+    const { scale, offsetX, offsetY } = viewTransform();
+    const vx = clamp((x - offsetX) / scale, 0, worldWidth());
+    const vy = clamp((y - offsetY) / scale, 0, worldHeight());
+    if (!shouldFlipBoard()) {
+      return { x: vx, y: vy };
+    }
+    return {
+      x: worldWidth() - vx,
+      y: worldHeight() - vy,
+    };
   }
 
   function colorsForOwner(owner) {
@@ -381,7 +415,12 @@
     canvas.style.height = `${state.height}px`;
     ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
 
-    if (oldWidth > 0 && oldHeight > 0 && state.nodes.length) {
+    if (!isMultiplayerClient()) {
+      state.worldWidth = state.width;
+      state.worldHeight = state.height;
+    }
+
+    if (oldWidth > 0 && oldHeight > 0 && state.nodes.length && !isMultiplayerClient()) {
       const sx = state.width / oldWidth;
       const sy = state.height / oldHeight;
       state.nodes.forEach((node) => {
@@ -513,6 +552,8 @@
     state.selected.clear();
     state.nextNodeId = 1;
     state.nextUnitId = 1;
+    state.worldWidth = state.width;
+    state.worldHeight = state.height;
     state.phase = options.phase ?? "playing";
     state.winner = null;
     state.match.snapshotElapsed = 0;
@@ -717,7 +758,6 @@
     }
 
     if (isMultiplayerClient()) {
-      executeUnitOrderToNode(localOwner(), unitIds, target);
       sendNetworkMessage({
         type: "order",
         order: {
@@ -743,15 +783,14 @@
     }
 
     if (isMultiplayerClient()) {
-      executeUnitOrderToPoint(localOwner(), unitIds, x, y);
       sendNetworkMessage({
         type: "order",
         order: {
           kind: "point",
           owner: localOwner(),
           unitIds,
-          xRatio: clamp(x / Math.max(1, state.width), 0, 1),
-          yRatio: clamp(y / Math.max(1, state.height), 0, 1),
+          xRatio: clamp(x / worldWidth(), 0, 1),
+          yRatio: clamp(y / worldHeight(), 0, 1),
         },
       });
     } else {
@@ -1237,8 +1276,8 @@
     });
 
     return {
-      width: state.width,
-      height: state.height,
+      width: worldWidth(),
+      height: worldHeight(),
       nodes,
       nodeMap,
       fleets,
@@ -2583,10 +2622,63 @@
     return true;
   }
 
+  function shouldSkipSnapshot(force) {
+    const socket = state.match.conn;
+    return (
+      !force &&
+      socket &&
+      Number.isFinite(socket.bufferedAmount) &&
+      socket.bufferedAmount > SNAPSHOT_BUFFER_LIMIT
+    );
+  }
+
+  function sameNullableNumber(a, b) {
+    if (a === null || a === undefined || b === null || b === undefined) {
+      return (a === null || a === undefined) && (b === null || b === undefined);
+    }
+    return Math.abs(Number(a) - Number(b)) < 0.001;
+  }
+
+  function movementTargetForSnapshotUnit(unit, nodeMap) {
+    if (unit.targetId !== null && unit.targetId !== undefined) {
+      const node = nodeMap.get(unit.targetId);
+      return node ? { x: node.x, y: node.y } : null;
+    }
+
+    if (Number.isFinite(unit.targetX) && Number.isFinite(unit.targetY)) {
+      return { x: unit.targetX, y: unit.targetY };
+    }
+
+    return null;
+  }
+
+  function shouldPreservePredictedPosition(previous, next, nodeMap) {
+    if (
+      !previous ||
+      previous.state !== "moving" ||
+      next.state !== "moving" ||
+      previous.owner !== next.owner ||
+      previous.targetId !== next.targetId ||
+      !sameNullableNumber(previous.targetX, next.targetX) ||
+      !sameNullableNumber(previous.targetY, next.targetY)
+    ) {
+      return false;
+    }
+
+    const target = movementTargetForSnapshotUnit(next, nodeMap);
+    if (!target) {
+      return false;
+    }
+
+    const previousDistance = distance(previous.x, previous.y, target.x, target.y);
+    const snapshotDistance = distance(next.x, next.y, target.x, target.y);
+    return previousDistance + 2 < snapshotDistance && previousDistance > 0.5;
+  }
+
   function serializeState() {
     return {
-      width: state.width,
-      height: state.height,
+      width: worldWidth(),
+      height: worldHeight(),
       phase: state.phase,
       winner: state.winner,
       nextNodeId: state.nextNodeId,
@@ -2628,19 +2720,10 @@
         orbitSpeed: unit.orbitSpeed,
         speed: unit.speed,
         ordered: unit.ordered,
-        trail: unit.trail.map((point) => ({ x: point.x, y: point.y })),
+        trail: unit.trail
+          .slice(-SNAPSHOT_TRAIL_POINTS)
+          .map((point) => ({ x: point.x, y: point.y })),
       })),
-    };
-  }
-
-  function scaleValue(value, scale) {
-    return Number.isFinite(value) ? value * scale : value;
-  }
-
-  function scalePoint(point, scaleX, scaleY) {
-    return {
-      x: point.x * scaleX,
-      y: point.y * scaleY,
     };
   }
 
@@ -2657,19 +2740,20 @@
       clearCountdown();
     }
 
-    const scaleX = state.width / Math.max(1, snapshot.width || state.width);
-    const scaleY = state.height / Math.max(1, snapshot.height || state.height);
+    state.worldWidth = Math.max(1, snapshot.width || state.width);
+    state.worldHeight = Math.max(1, snapshot.height || state.height);
     state.phase = snapshot.phase;
     state.winner = snapshot.winner || null;
     state.nextNodeId = snapshot.nextNodeId || 1;
     state.nextUnitId = snapshot.nextUnitId || 1;
     state.ai.lastOrder = snapshot.ai?.lastOrder || "multiplayer";
 
-    state.nodes = snapshot.nodes.map((node) => ({
+    const previousUnits = new Map(state.units.map((unit) => [unit.id, unit]));
+    const nextNodes = snapshot.nodes.map((node) => ({
       id: node.id,
       owner: node.owner,
-      x: node.x * scaleX,
-      y: node.y * scaleY,
+      x: node.x,
+      y: node.y,
       hp: node.hp,
       captureRequired: node.captureRequired,
       captureRemaining: node.captureRemaining,
@@ -2678,33 +2762,44 @@
       flash: node.flash,
       seed: node.seed,
     }));
+    const nextNodeMap = new Map(nextNodes.map((node) => [node.id, node]));
+    state.nodes = nextNodes;
 
-    state.units = snapshot.units.map((unit) => ({
-      id: unit.id,
-      owner: unit.owner,
-      homeNodeId: unit.homeNodeId,
-      state: unit.state,
-      nodeId: unit.nodeId,
-      targetId: unit.targetId,
-      targetX: scaleValue(unit.targetX, scaleX),
-      targetY: scaleValue(unit.targetY, scaleY),
-      guardX: scaleValue(unit.guardX, scaleX),
-      guardY: scaleValue(unit.guardY, scaleY),
-      nodeApproachAngle: unit.nodeApproachAngle,
-      nodeApproachPadding: unit.nodeApproachPadding,
-      x: unit.x * scaleX,
-      y: unit.y * scaleY,
-      angle: unit.angle,
-      orbitBlend: unit.orbitBlend,
-      orbitRadius: unit.orbitRadius,
-      orbitSpeed: unit.orbitSpeed,
-      speed: unit.speed,
-      selected: false,
-      ordered: unit.ordered,
-      trail: Array.isArray(unit.trail)
-        ? unit.trail.map((point) => scalePoint(point, scaleX, scaleY))
-        : [],
-    }));
+    state.units = snapshot.units.map((unit) => {
+      const next = {
+        id: unit.id,
+        owner: unit.owner,
+        homeNodeId: unit.homeNodeId,
+        state: unit.state,
+        nodeId: unit.nodeId,
+        targetId: unit.targetId,
+        targetX: unit.targetX,
+        targetY: unit.targetY,
+        guardX: unit.guardX,
+        guardY: unit.guardY,
+        nodeApproachAngle: unit.nodeApproachAngle,
+        nodeApproachPadding: unit.nodeApproachPadding,
+        x: unit.x,
+        y: unit.y,
+        angle: unit.angle,
+        orbitBlend: unit.orbitBlend,
+        orbitRadius: unit.orbitRadius,
+        orbitSpeed: unit.orbitSpeed,
+        speed: unit.speed,
+        selected: false,
+        ordered: unit.ordered,
+        trail: Array.isArray(unit.trail)
+          ? unit.trail.map((point) => ({ x: point.x, y: point.y }))
+          : [],
+      };
+      const previous = previousUnits.get(next.id);
+      if (shouldPreservePredictedPosition(previous, next, nextNodeMap)) {
+        next.x = previous.x;
+        next.y = previous.y;
+        next.trail = previous.trail.map((point) => ({ x: point.x, y: point.y }));
+      }
+      return next;
+    });
 
     state.selected.forEach((id) => {
       const unit = state.units.find((candidate) => candidate.id === id);
@@ -2741,8 +2836,13 @@
       return;
     }
 
+    if (shouldSkipSnapshot(force)) {
+      return;
+    }
+
     sendNetworkMessage({
       type: "snapshot",
+      priority: force,
       snapshot: serializeState(),
     });
     state.match.snapshotElapsed = 0;
@@ -2760,7 +2860,7 @@
 
     state.match.snapshotElapsed += dt;
     if (state.match.snapshotElapsed >= SNAPSHOT_INTERVAL) {
-      sendSnapshot(true);
+      sendSnapshot(false);
     }
   }
 
@@ -3027,8 +3127,8 @@
         sent = executeUnitOrderToNode(OWNER.AI, unitIds, target);
       }
     } else if (order.kind === "point") {
-      const x = clamp(Number(order.xRatio) || 0, 0, 1) * state.width;
-      const y = clamp(Number(order.yRatio) || 0, 0, 1) * state.height;
+      const x = clamp(Number(order.xRatio) || 0, 0, 1) * worldWidth();
+      const y = clamp(Number(order.yRatio) || 0, 0, 1) * worldHeight();
       sent = executeUnitOrderToPoint(OWNER.AI, unitIds, x, y);
     }
 
@@ -3214,20 +3314,20 @@
       ctx.globalAlpha = 0.18 * node.flash;
       ctx.fillStyle = colors.line;
       ctx.beginPath();
-      ctx.arc(point.x, point.y, node.radius + 9, 0, TAU);
+      ctx.arc(point.x, point.y, toViewRadius(node.radius + 9), 0, TAU);
       ctx.fill();
       ctx.globalAlpha = 1;
     }
 
     ctx.fillStyle = colors.fill;
     ctx.beginPath();
-    ctx.arc(point.x, point.y, node.radius, 0, TAU);
+    ctx.arc(point.x, point.y, toViewRadius(node.radius), 0, TAU);
     ctx.fill();
 
     ctx.lineWidth = 2;
     ctx.strokeStyle = colors.line;
     ctx.beginPath();
-    ctx.arc(point.x, point.y, node.radius, 0, TAU);
+    ctx.arc(point.x, point.y, toViewRadius(node.radius), 0, TAU);
     ctx.stroke();
 
     ctx.restore();
@@ -3294,7 +3394,7 @@
       ctx.strokeStyle = "#0071e3";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.arc(point.x, point.y, node.radius + 12, 0, TAU);
+      ctx.arc(point.x, point.y, toViewRadius(node.radius + 12), 0, TAU);
       ctx.stroke();
       ctx.restore();
     }
@@ -3333,7 +3433,7 @@
       ctx.strokeStyle = "#0071e3";
       ctx.lineWidth = 1.8;
       ctx.beginPath();
-      ctx.arc(point.x, point.y, circle.radius, 0, TAU);
+      ctx.arc(point.x, point.y, toViewRadius(circle.radius), 0, TAU);
       ctx.fill();
       ctx.stroke();
       ctx.restore();
