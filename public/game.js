@@ -33,9 +33,10 @@
   const NETWORK_PROTOCOL = "node-field-v1";
   const SERVER_URL = resolveServerUrl();
   const ROOM_PARAM = "room";
-  const SNAPSHOT_INTERVAL = 0.08;
-  const SNAPSHOT_BUFFER_LIMIT = 256 * 1024;
-  const SNAPSHOT_TRAIL_POINTS = 2;
+  const SNAPSHOT_SCHEMA = 2;
+  const SNAPSHOT_INTERVAL = 0.04;
+  const SNAPSHOT_BUFFER_LIMIT = 64 * 1024;
+  const ORDER_ACK_GRACE_MS = 1200;
   const JOIN_TIMEOUT_MS = 10000;
   const COUNTDOWN_STEP_MS = 800;
   const COUNTDOWN_STEPS = ["3", "2", "1", "Start!"];
@@ -85,6 +86,9 @@
     AI: "ai",
     NEUTRAL: "neutral",
   };
+
+  const OWNER_BY_CODE = [OWNER.PLAYER, OWNER.AI, OWNER.NEUTRAL];
+  const UNIT_STATE_BY_CODE = ["stationed", "moving", "guarding"];
 
   const COLORS = {
     player: {
@@ -143,6 +147,12 @@
       closing: false,
       joinTimer: null,
       snapshotElapsed: 0,
+      snapshotSequence: 0,
+      lastAppliedSnapshotSequence: 0,
+      orderSequence: 0,
+      pendingOrderAck: null,
+      pendingOrderSince: 0,
+      pendingSnapshot: null,
       clientId:
         typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
           ? crypto.randomUUID()
@@ -162,6 +172,57 @@
 
   function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
+  }
+
+  function numberOr(value, fallback = 0) {
+    if (value === null || value === undefined) {
+      return fallback;
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  }
+
+  function nullableNumber(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  function packNumber(value) {
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+    return Math.round(value * 100) / 100;
+  }
+
+  function packNullableNumber(value) {
+    return value === null || value === undefined ? null : packNumber(value);
+  }
+
+  function encodeOwner(owner) {
+    const index = OWNER_BY_CODE.indexOf(owner);
+    return index === -1 ? 2 : index;
+  }
+
+  function decodeOwner(owner) {
+    if (typeof owner === "string") {
+      return OWNER_BY_CODE.includes(owner) ? owner : OWNER.NEUTRAL;
+    }
+    return OWNER_BY_CODE[numberOr(owner, 2)] || OWNER.NEUTRAL;
+  }
+
+  function encodeUnitState(unitState) {
+    const index = UNIT_STATE_BY_CODE.indexOf(unitState);
+    return index === -1 ? 0 : index;
+  }
+
+  function decodeUnitState(unitState) {
+    if (typeof unitState === "string") {
+      return UNIT_STATE_BY_CODE.includes(unitState) ? unitState : "stationed";
+    }
+    return UNIT_STATE_BY_CODE[numberOr(unitState, 0)] || "stationed";
   }
 
   function hashSeed(value) {
@@ -557,6 +618,9 @@
     state.phase = options.phase ?? "playing";
     state.winner = null;
     state.match.snapshotElapsed = 0;
+    state.match.pendingSnapshot = null;
+    state.match.pendingOrderAck = null;
+    state.match.pendingOrderSince = 0;
     state.ai.elapsed = 0;
     state.ai.lastOrder = state.match.mode === "multi" ? "multiplayer" : "opening";
     messageEl.classList.remove("countdown-message", "countdown-pop");
@@ -750,6 +814,16 @@
     return sent;
   }
 
+  function nextOrderId() {
+    state.match.orderSequence += 1;
+    return `${state.match.clientId}:${state.match.orderSequence}`;
+  }
+
+  function markPendingOrder(orderId) {
+    state.match.pendingOrderAck = orderId;
+    state.match.pendingOrderSince = performance.now();
+  }
+
   function dispatchSelected(target) {
     const selectedUnits = selectedLocalUnits();
     const unitIds = selectedUnits.map((unit) => unit.id);
@@ -758,15 +832,20 @@
     }
 
     if (isMultiplayerClient()) {
-      sendNetworkMessage({
+      const order = {
+        kind: "node",
+        owner: localOwner(),
+        unitIds,
+        targetId: target.id,
+        orderId: nextOrderId(),
+      };
+      if (sendNetworkMessage({
         type: "order",
-        order: {
-          kind: "node",
-          owner: localOwner(),
-          unitIds,
-          targetId: target.id,
-        },
-      });
+        order,
+      })) {
+        markPendingOrder(order.orderId);
+        executeUnitOrderToNode(localOwner(), unitIds, target);
+      }
     } else {
       executeUnitOrderToNode(localOwner(), unitIds, target);
       sendSnapshot(true);
@@ -783,16 +862,21 @@
     }
 
     if (isMultiplayerClient()) {
-      sendNetworkMessage({
+      const order = {
+        kind: "point",
+        owner: localOwner(),
+        unitIds,
+        xRatio: clamp(x / worldWidth(), 0, 1),
+        yRatio: clamp(y / worldHeight(), 0, 1),
+        orderId: nextOrderId(),
+      };
+      if (sendNetworkMessage({
         type: "order",
-        order: {
-          kind: "point",
-          owner: localOwner(),
-          unitIds,
-          xRatio: clamp(x / worldWidth(), 0, 1),
-          yRatio: clamp(y / worldHeight(), 0, 1),
-        },
-      });
+        order,
+      })) {
+        markPendingOrder(order.orderId);
+        executeUnitOrderToPoint(localOwner(), unitIds, x, y);
+      }
     } else {
       executeUnitOrderToPoint(localOwner(), unitIds, x, y);
       sendSnapshot(true);
@@ -2579,6 +2663,12 @@
     state.match.conn = null;
     state.match.closing = false;
     state.match.snapshotElapsed = 0;
+    state.match.snapshotSequence = 0;
+    state.match.lastAppliedSnapshotSequence = 0;
+    state.match.orderSequence = 0;
+    state.match.pendingOrderAck = null;
+    state.match.pendingOrderSince = 0;
+    state.match.pendingSnapshot = null;
   }
 
   function closeNetwork() {
@@ -2607,6 +2697,12 @@
     state.match.conn = null;
     state.match.closing = false;
     state.match.snapshotElapsed = 0;
+    state.match.snapshotSequence = 0;
+    state.match.lastAppliedSnapshotSequence = 0;
+    state.match.orderSequence = 0;
+    state.match.pendingOrderAck = null;
+    state.match.pendingOrderSince = 0;
+    state.match.pendingSnapshot = null;
   }
 
   function sendNetworkMessage(message) {
@@ -2675,8 +2771,20 @@
     return previousDistance + 2 < snapshotDistance && previousDistance > 0.5;
   }
 
-  function serializeState() {
-    return {
+  function nextSnapshotSequence() {
+    state.match.snapshotSequence += 1;
+    return state.match.snapshotSequence;
+  }
+
+  function snapshotSequence(snapshot) {
+    const sequence = Number(snapshot?.sequence);
+    return Number.isFinite(sequence) ? sequence : null;
+  }
+
+  function serializeState(options = {}) {
+    const snapshot = {
+      schema: SNAPSHOT_SCHEMA,
+      sequence: options.sequence ?? null,
       width: worldWidth(),
       height: worldHeight(),
       phase: state.phase,
@@ -2686,50 +2794,163 @@
       ai: {
         lastOrder: state.ai.lastOrder,
       },
-      nodes: state.nodes.map((node) => ({
-        id: node.id,
-        owner: node.owner,
-        x: node.x,
-        y: node.y,
-        hp: node.hp,
-        captureRequired: node.captureRequired,
-        captureRemaining: node.captureRemaining,
-        radius: node.radius,
-        production: node.production,
-        flash: node.flash,
-        seed: node.seed,
-      })),
-      units: state.units.map((unit) => ({
-        id: unit.id,
-        owner: unit.owner,
-        homeNodeId: unit.homeNodeId,
-        state: unit.state,
-        nodeId: unit.nodeId,
-        targetId: unit.targetId,
-        targetX: unit.targetX,
-        targetY: unit.targetY,
-        guardX: unit.guardX,
-        guardY: unit.guardY,
-        nodeApproachAngle: unit.nodeApproachAngle,
-        nodeApproachPadding: unit.nodeApproachPadding,
-        x: unit.x,
-        y: unit.y,
-        angle: unit.angle,
-        orbitBlend: unit.orbitBlend,
-        orbitRadius: unit.orbitRadius,
-        orbitSpeed: unit.orbitSpeed,
-        speed: unit.speed,
-        ordered: unit.ordered,
-        trail: unit.trail
-          .slice(-SNAPSHOT_TRAIL_POINTS)
-          .map((point) => ({ x: point.x, y: point.y })),
-      })),
+      nodes: state.nodes.map((node) => [
+        node.id,
+        encodeOwner(node.owner),
+        packNumber(node.x),
+        packNumber(node.y),
+        node.hp,
+        node.captureRequired,
+        node.captureRemaining,
+        packNumber(node.radius),
+        packNumber(node.production),
+        packNumber(node.flash),
+        packNumber(node.seed),
+      ]),
+      units: state.units.map((unit) => [
+        unit.id,
+        encodeOwner(unit.owner),
+        unit.homeNodeId ?? null,
+        encodeUnitState(unit.state),
+        unit.nodeId ?? null,
+        unit.targetId ?? null,
+        packNullableNumber(unit.targetX),
+        packNullableNumber(unit.targetY),
+        packNullableNumber(unit.guardX),
+        packNullableNumber(unit.guardY),
+        packNullableNumber(unit.nodeApproachAngle),
+        packNullableNumber(unit.nodeApproachPadding),
+        packNumber(unit.x),
+        packNumber(unit.y),
+        packNumber(unit.angle),
+        packNumber(unit.orbitBlend),
+        packNumber(unit.orbitRadius),
+        packNumber(unit.orbitSpeed),
+        packNumber(unit.speed),
+        unit.ordered ? 1 : 0,
+      ]),
+    };
+
+    if (options.ackOrderId) {
+      snapshot.ackOrderId = options.ackOrderId;
+    }
+
+    return snapshot;
+  }
+
+  function normalizeSnapshotNode(node) {
+    if (Array.isArray(node)) {
+      return {
+        id: numberOr(node[0]),
+        owner: decodeOwner(node[1]),
+        x: numberOr(node[2]),
+        y: numberOr(node[3]),
+        hp: numberOr(node[4]),
+        captureRequired: numberOr(node[5]),
+        captureRemaining: numberOr(node[6]),
+        radius: numberOr(node[7], 24),
+        production: numberOr(node[8]),
+        flash: numberOr(node[9]),
+        seed: numberOr(node[10]),
+      };
+    }
+
+    const source = node || {};
+    return {
+      id: numberOr(source.id),
+      owner: decodeOwner(source.owner),
+      x: numberOr(source.x),
+      y: numberOr(source.y),
+      hp: numberOr(source.hp),
+      captureRequired: numberOr(source.captureRequired),
+      captureRemaining: numberOr(source.captureRemaining),
+      radius: numberOr(source.radius, 24),
+      production: numberOr(source.production),
+      flash: numberOr(source.flash),
+      seed: numberOr(source.seed),
     };
   }
 
-  function applySnapshot(snapshot) {
+  function normalizeSnapshotTrail(trail) {
+    if (!Array.isArray(trail)) {
+      return [];
+    }
+    return trail.map((point) => ({
+      x: numberOr(point?.x),
+      y: numberOr(point?.y),
+    }));
+  }
+
+  function normalizeSnapshotUnit(unit) {
+    if (Array.isArray(unit)) {
+      return {
+        id: numberOr(unit[0]),
+        owner: decodeOwner(unit[1]),
+        homeNodeId: nullableNumber(unit[2]),
+        state: decodeUnitState(unit[3]),
+        nodeId: nullableNumber(unit[4]),
+        targetId: nullableNumber(unit[5]),
+        targetX: nullableNumber(unit[6]),
+        targetY: nullableNumber(unit[7]),
+        guardX: nullableNumber(unit[8]),
+        guardY: nullableNumber(unit[9]),
+        nodeApproachAngle: nullableNumber(unit[10]),
+        nodeApproachPadding: nullableNumber(unit[11]),
+        x: numberOr(unit[12]),
+        y: numberOr(unit[13]),
+        angle: numberOr(unit[14]),
+        orbitBlend: numberOr(unit[15], 1),
+        orbitRadius: numberOr(unit[16], 20),
+        orbitSpeed: numberOr(unit[17], 0.25),
+        speed: numberOr(unit[18], AI_AVERAGE_SPEED),
+        selected: false,
+        ordered: Boolean(unit[19]),
+        trail: [],
+      };
+    }
+
+    const source = unit || {};
+    return {
+      id: numberOr(source.id),
+      owner: decodeOwner(source.owner),
+      homeNodeId: nullableNumber(source.homeNodeId),
+      state: decodeUnitState(source.state),
+      nodeId: nullableNumber(source.nodeId),
+      targetId: nullableNumber(source.targetId),
+      targetX: nullableNumber(source.targetX),
+      targetY: nullableNumber(source.targetY),
+      guardX: nullableNumber(source.guardX),
+      guardY: nullableNumber(source.guardY),
+      nodeApproachAngle: nullableNumber(source.nodeApproachAngle),
+      nodeApproachPadding: nullableNumber(source.nodeApproachPadding),
+      x: numberOr(source.x),
+      y: numberOr(source.y),
+      angle: numberOr(source.angle),
+      orbitBlend: numberOr(source.orbitBlend, 1),
+      orbitRadius: numberOr(source.orbitRadius, 20),
+      orbitSpeed: numberOr(source.orbitSpeed, 0.25),
+      speed: numberOr(source.speed, AI_AVERAGE_SPEED),
+      selected: false,
+      ordered: Boolean(source.ordered),
+      trail: normalizeSnapshotTrail(source.trail),
+    };
+  }
+
+  function applySnapshot(snapshot, options = {}) {
     if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.units)) {
       return;
+    }
+
+    const sequence = snapshotSequence(snapshot);
+    if (sequence !== null) {
+      state.match.lastAppliedSnapshotSequence = Math.max(
+        state.match.lastAppliedSnapshotSequence,
+        sequence,
+      );
+    }
+    if (snapshot.ackOrderId && snapshot.ackOrderId === state.match.pendingOrderAck) {
+      state.match.pendingOrderAck = null;
+      state.match.pendingOrderSince = 0;
     }
 
     if (
@@ -2749,49 +2970,12 @@
     state.ai.lastOrder = snapshot.ai?.lastOrder || "multiplayer";
 
     const previousUnits = new Map(state.units.map((unit) => [unit.id, unit]));
-    const nextNodes = snapshot.nodes.map((node) => ({
-      id: node.id,
-      owner: node.owner,
-      x: node.x,
-      y: node.y,
-      hp: node.hp,
-      captureRequired: node.captureRequired,
-      captureRemaining: node.captureRemaining,
-      radius: node.radius,
-      production: node.production,
-      flash: node.flash,
-      seed: node.seed,
-    }));
+    const nextNodes = snapshot.nodes.map(normalizeSnapshotNode);
     const nextNodeMap = new Map(nextNodes.map((node) => [node.id, node]));
     state.nodes = nextNodes;
 
     state.units = snapshot.units.map((unit) => {
-      const next = {
-        id: unit.id,
-        owner: unit.owner,
-        homeNodeId: unit.homeNodeId,
-        state: unit.state,
-        nodeId: unit.nodeId,
-        targetId: unit.targetId,
-        targetX: unit.targetX,
-        targetY: unit.targetY,
-        guardX: unit.guardX,
-        guardY: unit.guardY,
-        nodeApproachAngle: unit.nodeApproachAngle,
-        nodeApproachPadding: unit.nodeApproachPadding,
-        x: unit.x,
-        y: unit.y,
-        angle: unit.angle,
-        orbitBlend: unit.orbitBlend,
-        orbitRadius: unit.orbitRadius,
-        orbitSpeed: unit.orbitSpeed,
-        speed: unit.speed,
-        selected: false,
-        ordered: unit.ordered,
-        trail: Array.isArray(unit.trail)
-          ? unit.trail.map((point) => ({ x: point.x, y: point.y }))
-          : [],
-      };
+      const next = normalizeSnapshotUnit(unit);
       const previous = previousUnits.get(next.id);
       if (shouldPreservePredictedPosition(previous, next, nextNodeMap)) {
         next.x = previous.x;
@@ -2819,10 +3003,12 @@
     ) {
       messageEl.hidden = true;
     }
-    updateHud();
+    if (options.updateHud !== false) {
+      updateHud();
+    }
   }
 
-  function sendSnapshot(force = false) {
+  function sendSnapshot(force = false, options = {}) {
     if (
       state.match.mode !== "multi" ||
       !state.match.isHost ||
@@ -2843,7 +3029,10 @@
     sendNetworkMessage({
       type: "snapshot",
       priority: force,
-      snapshot: serializeState(),
+      snapshot: serializeState({
+        sequence: nextSnapshotSequence(),
+        ackOrderId: options.ackOrderId,
+      }),
     });
     state.match.snapshotElapsed = 0;
   }
@@ -3000,7 +3189,7 @@
     sendNetworkMessage({
       type: "init",
       roomId: state.match.roomId,
-      snapshot: serializeState(),
+      snapshot: serializeState({ sequence: nextSnapshotSequence() }),
     });
   }
 
@@ -3010,6 +3199,68 @@
       sendSnapshot(true);
     });
     sendInitSnapshot();
+  }
+
+  function shouldDeferSnapshotForOrderAck(snapshot) {
+    if (!state.match.pendingOrderAck) {
+      return false;
+    }
+
+    if (snapshot?.ackOrderId === state.match.pendingOrderAck) {
+      state.match.pendingOrderAck = null;
+      state.match.pendingOrderSince = 0;
+      return false;
+    }
+
+    if (
+      state.match.pendingOrderSince > 0 &&
+      performance.now() - state.match.pendingOrderSince > ORDER_ACK_GRACE_MS
+    ) {
+      state.match.pendingOrderAck = null;
+      state.match.pendingOrderSince = 0;
+      return false;
+    }
+
+    return true;
+  }
+
+  function queueSnapshot(snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.units)) {
+      return;
+    }
+
+    if (shouldDeferSnapshotForOrderAck(snapshot)) {
+      return;
+    }
+
+    const sequence = snapshotSequence(snapshot);
+    if (
+      sequence !== null &&
+      sequence <= state.match.lastAppliedSnapshotSequence
+    ) {
+      return;
+    }
+
+    const pendingSequence = snapshotSequence(state.match.pendingSnapshot);
+    if (
+      sequence !== null &&
+      pendingSequence !== null &&
+      sequence <= pendingSequence
+    ) {
+      return;
+    }
+
+    state.match.pendingSnapshot = snapshot;
+  }
+
+  function applyPendingSnapshot() {
+    if (!state.match.pendingSnapshot) {
+      return;
+    }
+
+    const snapshot = state.match.pendingSnapshot;
+    state.match.pendingSnapshot = null;
+    applySnapshot(snapshot, { updateHud: false });
   }
 
   function handleNetworkMessage(message) {
@@ -3069,6 +3320,9 @@
         !messageEl.hidden &&
         messageEl.classList.contains("countdown-message");
       state.match.roomId = message.roomId || state.match.roomId;
+      state.match.pendingSnapshot = null;
+      state.match.pendingOrderAck = null;
+      state.match.pendingOrderSince = 0;
       applySnapshot(message.snapshot);
       state.match.connected = true;
       showHomeScreen(false);
@@ -3079,7 +3333,7 @@
     }
 
     if (message.type === "snapshot" && !state.match.isHost) {
-      applySnapshot(message.snapshot);
+      queueSnapshot(message.snapshot);
       return;
     }
 
@@ -3120,6 +3374,7 @@
       return;
     }
 
+    const ackOrderId = typeof order.orderId === "string" ? order.orderId : null;
     let sent = 0;
     if (order.kind === "node") {
       const target = getNode(Number(order.targetId));
@@ -3134,8 +3389,8 @@
 
     if (sent > 0) {
       state.ai.lastOrder = "guest order";
-      sendSnapshot(true);
     }
+    sendSnapshot(true, { ackOrderId });
   }
 
   function reportRoomNotFound() {
@@ -3281,6 +3536,7 @@
 
   function update(dt) {
     if (isMultiplayerClient()) {
+      applyPendingSnapshot();
       if (state.phase === "playing") {
         updateClientVisuals(dt);
       } else if (state.phase === "ended") {
