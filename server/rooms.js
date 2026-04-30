@@ -71,7 +71,6 @@ export function createRoomSocketServer(server, { protocol }) {
       id: requestedRoomId,
       host: ws,
       guest: null,
-      sequence: 0,
       createdAt: Date.now(),
     };
     rooms.set(room.id, room);
@@ -103,30 +102,16 @@ export function createRoomSocketServer(server, { protocol }) {
     send(room.host, { type: "guestJoined", roomId: room.id });
   }
 
-  function broadcastRoomEvent(ws, message) {
+  function relayToRoomPeer(ws, message, fromRole, targetRole) {
     const client = clients.get(ws);
-    if (!client?.roomId || !client.role) {
+    if (client?.role !== fromRole) {
       return;
     }
 
     const room = rooms.get(client.roomId);
-    if (!room || room[client.role] !== ws) {
-      return;
-    }
-
-    const event = {
-      ...message,
-      roomId: room.id,
-      senderId: client.clientId,
-      senderRole: client.role,
-      sequence: ++room.sequence,
-    };
-
-    if (room.host) {
-      send(room.host, event);
-    }
-    if (room.guest) {
-      send(room.guest, event);
+    const peer = room?.[targetRole];
+    if (peer) {
+      send(peer, message);
     }
   }
 
@@ -153,9 +138,10 @@ export function createRoomSocketServer(server, { protocol }) {
         break;
       case "init":
       case "snapshot":
+        relayToRoomPeer(ws, message, "host", "guest");
+        break;
       case "order":
-      case "matchEnded":
-        broadcastRoomEvent(ws, message);
+        relayToRoomPeer(ws, message, "guest", "host");
         break;
       default:
         send(ws, { type: "serverError", message: `Unknown message type: ${message.type}` });

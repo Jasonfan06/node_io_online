@@ -33,12 +33,10 @@
   const NETWORK_PROTOCOL = "node-field-v1";
   const SERVER_URL = resolveServerUrl();
   const ROOM_PARAM = "room";
+  const SNAPSHOT_INTERVAL = 0.08;
   const JOIN_TIMEOUT_MS = 10000;
   const COUNTDOWN_STEP_MS = 800;
   const COUNTDOWN_STEPS = ["3", "2", "1", "Start!"];
-  const SIMULATION_STEP = 1 / 60;
-  const MAX_SIMULATION_STEPS = 5;
-  const SHARED_ORDER_DELAY_TICKS = 6;
   const ROOM_MIN = 100000;
   const ROOM_MAX = 999999;
   const AI_DECISION_INTERVAL = 0.28;
@@ -115,12 +113,8 @@
     height: 0,
     dpr: 1,
     lastTime: performance.now(),
-    elapsed: 0,
-    simAccumulator: 0,
-    simTick: 0,
     nodes: [],
     units: [],
-    pendingOrders: [],
     selected: new Set(),
     nextNodeId: 1,
     nextUnitId: 1,
@@ -144,6 +138,7 @@
       conn: null,
       closing: false,
       joinTimer: null,
+      snapshotElapsed: 0,
       clientId:
         typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
           ? crypto.randomUUID()
@@ -241,7 +236,7 @@
   }
 
   function randomDirection() {
-    return state.rng() > 0.5 ? 1 : -1;
+    return Math.random() > 0.5 ? 1 : -1;
   }
 
   function randomOrbitSpeed(min, max) {
@@ -325,8 +320,8 @@
     return owner === localOwner() ? COLORS.player : COLORS.ai;
   }
 
-  function isMultiplayerMatch() {
-    return state.match.mode === "multi";
+  function isMultiplayerClient() {
+    return state.match.mode === "multi" && !state.match.isHost;
   }
 
   function isAiEnabled() {
@@ -515,15 +510,12 @@
     setRandomSeed(seed);
     state.nodes = [];
     state.units = [];
-    state.pendingOrders = [];
     state.selected.clear();
     state.nextNodeId = 1;
     state.nextUnitId = 1;
-    state.elapsed = 0;
-    state.simAccumulator = 0;
-    state.simTick = 0;
     state.phase = options.phase ?? "playing";
     state.winner = null;
+    state.match.snapshotElapsed = 0;
     state.ai.elapsed = 0;
     state.ai.lastOrder = state.match.mode === "multi" ? "multiplayer" : "opening";
     messageEl.classList.remove("countdown-message", "countdown-pop");
@@ -724,23 +716,22 @@
       return;
     }
 
-    if (isMultiplayerMatch()) {
-      if (sendNetworkMessage({
+    if (isMultiplayerClient()) {
+      executeUnitOrderToNode(localOwner(), unitIds, target);
+      sendNetworkMessage({
         type: "order",
         order: {
           kind: "node",
           owner: localOwner(),
           unitIds,
           targetId: target.id,
-          applyTick: state.simTick + SHARED_ORDER_DELAY_TICKS,
         },
-      })) {
-        clearSelection();
-      }
-      return;
+      });
+    } else {
+      executeUnitOrderToNode(localOwner(), unitIds, target);
+      sendSnapshot(true);
     }
 
-    executeUnitOrderToNode(localOwner(), unitIds, target);
     clearSelection();
   }
 
@@ -751,8 +742,9 @@
       return;
     }
 
-    if (isMultiplayerMatch()) {
-      if (sendNetworkMessage({
+    if (isMultiplayerClient()) {
+      executeUnitOrderToPoint(localOwner(), unitIds, x, y);
+      sendNetworkMessage({
         type: "order",
         order: {
           kind: "point",
@@ -760,15 +752,13 @@
           unitIds,
           xRatio: clamp(x / Math.max(1, state.width), 0, 1),
           yRatio: clamp(y / Math.max(1, state.height), 0, 1),
-          applyTick: state.simTick + SHARED_ORDER_DELAY_TICKS,
         },
-      })) {
-        clearSelection();
-      }
-      return;
+      });
+    } else {
+      executeUnitOrderToPoint(localOwner(), unitIds, x, y);
+      sendSnapshot(true);
     }
 
-    executeUnitOrderToPoint(localOwner(), unitIds, x, y);
     clearSelection();
   }
 
@@ -909,7 +899,7 @@
     unit.orbitRadius +=
       (node.radius + 15 - unit.orbitRadius) * dt * 0.2 * orbitBlend;
     unit.orbitBlend = clamp(orbitBlend + dt * 2.4, 0, 1);
-    const wobble = Math.sin(state.elapsed * 1.4 + unit.id) * 1.4 * orbitBlend;
+    const wobble = Math.sin(performance.now() * 0.0014 + unit.id) * 1.4 * orbitBlend;
     unit.x = node.x + Math.cos(unit.angle) * (unit.orbitRadius + wobble);
     unit.y = node.y + Math.sin(unit.angle) * (unit.orbitRadius + wobble);
     return true;
@@ -921,7 +911,7 @@
     }
 
     unit.angle += unit.orbitSpeed * dt;
-    const wobble = Math.sin(state.elapsed * 1.3 + unit.id) * 0.45;
+    const wobble = Math.sin(performance.now() * 0.0013 + unit.id) * 0.45;
     const hoverRadius = Math.max(0.5, unit.orbitRadius + wobble);
     unit.x = unit.guardX + Math.cos(unit.angle) * hoverRadius;
     unit.y = unit.guardY + Math.sin(unit.angle) * hoverRadius;
@@ -2331,23 +2321,12 @@
     messageEl.hidden = false;
   }
 
-  function finishMatch(winner, announce = true) {
-    if (winner !== OWNER.PLAYER && winner !== OWNER.AI) {
-      return;
-    }
-
-    if (state.phase === "ended" && state.winner) {
-      return;
-    }
-
+  function finishMatch(winner) {
     state.phase = "ended";
     state.winner = winner;
     updateResultMessage();
     clearSelection();
-
-    if (announce && isMultiplayerMatch()) {
-      sendNetworkMessage({ type: "matchEnded", winner });
-    }
+    sendSnapshot(true);
   }
 
   function checkWinLoss() {
@@ -2386,7 +2365,6 @@
     clearCountdown();
     const token = state.countdown.token;
     state.phase = "countdown";
-    state.simAccumulator = 0;
     clearSelection();
 
     let index = 0;
@@ -2401,7 +2379,6 @@
         messageEl.hidden = true;
         state.phase = "playing";
         state.lastTime = performance.now();
-        state.simAccumulator = 0;
         if (typeof onComplete === "function") {
           onComplete();
         }
@@ -2562,6 +2539,7 @@
     state.match.roomId = null;
     state.match.conn = null;
     state.match.closing = false;
+    state.match.snapshotElapsed = 0;
   }
 
   function closeNetwork() {
@@ -2589,6 +2567,7 @@
     state.match.connected = false;
     state.match.conn = null;
     state.match.closing = false;
+    state.match.snapshotElapsed = 0;
   }
 
   function sendNetworkMessage(message) {
@@ -2608,8 +2587,6 @@
     return {
       width: state.width,
       height: state.height,
-      elapsed: state.elapsed,
-      simTick: state.simTick,
       phase: state.phase,
       winner: state.winner,
       nextNodeId: state.nextNodeId,
@@ -2682,9 +2659,6 @@
 
     const scaleX = state.width / Math.max(1, snapshot.width || state.width);
     const scaleY = state.height / Math.max(1, snapshot.height || state.height);
-    state.elapsed = Number.isFinite(snapshot.elapsed) ? snapshot.elapsed : 0;
-    state.simTick = Number.isFinite(snapshot.simTick) ? snapshot.simTick : 0;
-    state.simAccumulator = 0;
     state.phase = snapshot.phase;
     state.winner = snapshot.winner || null;
     state.nextNodeId = snapshot.nextNodeId || 1;
@@ -2751,6 +2725,43 @@
       messageEl.hidden = true;
     }
     updateHud();
+  }
+
+  function sendSnapshot(force = false) {
+    if (
+      state.match.mode !== "multi" ||
+      !state.match.isHost ||
+      !state.match.connected ||
+      !state.match.conn
+    ) {
+      return;
+    }
+
+    if (!force && state.match.snapshotElapsed < SNAPSHOT_INTERVAL) {
+      return;
+    }
+
+    sendNetworkMessage({
+      type: "snapshot",
+      snapshot: serializeState(),
+    });
+    state.match.snapshotElapsed = 0;
+  }
+
+  function updateNetwork(dt) {
+    if (
+      state.match.mode !== "multi" ||
+      !state.match.isHost ||
+      !state.match.connected ||
+      (state.phase !== "playing" && state.phase !== "ended")
+    ) {
+      return;
+    }
+
+    state.match.snapshotElapsed += dt;
+    if (state.match.snapshotElapsed >= SNAPSHOT_INTERVAL) {
+      sendSnapshot(true);
+    }
   }
 
   function ensureSocketSupport() {
@@ -2895,8 +2906,9 @@
 
   function startHostCountdown() {
     showHomeScreen(false);
-    state.phase = "countdown";
-    clearSelection();
+    startCountdown(() => {
+      sendSnapshot(true);
+    });
     sendInitSnapshot();
   }
 
@@ -2951,35 +2963,28 @@
       return;
     }
 
-    if (message.type === "init" && isMultiplayerMatch()) {
+    if (message.type === "init" && !state.match.isHost) {
       const wasCounting =
         state.phase === "countdown" &&
         !messageEl.hidden &&
         messageEl.classList.contains("countdown-message");
       state.match.roomId = message.roomId || state.match.roomId;
-      state.match.connected = true;
-      state.pendingOrders = [];
       applySnapshot(message.snapshot);
+      state.match.connected = true;
       showHomeScreen(false);
       if (state.phase === "countdown" && !wasCounting) {
         startCountdown();
       }
-      updateHud();
       return;
     }
 
-    if (message.type === "snapshot" && isMultiplayerMatch()) {
+    if (message.type === "snapshot" && !state.match.isHost) {
       applySnapshot(message.snapshot);
       return;
     }
 
-    if (message.type === "order" && isMultiplayerMatch()) {
-      queueSharedOrder(message.order, message.sequence);
-      return;
-    }
-
-    if (message.type === "matchEnded" && isMultiplayerMatch()) {
-      finishMatch(message.winner, false);
+    if (message.type === "order" && state.match.isHost) {
+      handleRemoteOrder(message.order);
       return;
     }
 
@@ -2992,7 +2997,7 @@
       if (state.match.isHost) {
         showHostWaitingRoom(state.match.roomId);
       } else {
-        showMultiplayerMenu("Opponent disconnected", "error");
+        showMultiplayerMenu("Host disconnected", "error");
       }
       updateHud();
       return;
@@ -3003,39 +3008,8 @@
     }
   }
 
-  function queueSharedOrder(order, sequence = 0) {
-    if (!order || (order.owner !== OWNER.PLAYER && order.owner !== OWNER.AI)) {
-      return;
-    }
-
-    const applyTick = Number.isFinite(order.applyTick)
-      ? Math.max(0, Math.floor(order.applyTick))
-      : state.simTick;
-
-    state.pendingOrders.push({
-      order,
-      applyTick,
-      sequence: Number.isFinite(sequence) ? sequence : 0,
-    });
-    state.pendingOrders.sort((a, b) => a.applyTick - b.applyTick || a.sequence - b.sequence);
-  }
-
-  function processPendingOrders() {
-    while (
-      state.pendingOrders.length > 0 &&
-      state.pendingOrders[0].applyTick <= state.simTick
-    ) {
-      const next = state.pendingOrders.shift();
-      handleSharedOrder(next.order);
-    }
-  }
-
-  function handleSharedOrder(order) {
-    if (
-      !order ||
-      (order.owner !== OWNER.PLAYER && order.owner !== OWNER.AI) ||
-      state.phase !== "playing"
-    ) {
+  function handleRemoteOrder(order) {
+    if (!order || order.owner !== OWNER.AI || state.phase !== "playing") {
       return;
     }
 
@@ -3050,16 +3024,17 @@
     if (order.kind === "node") {
       const target = getNode(Number(order.targetId));
       if (target) {
-        sent = executeUnitOrderToNode(order.owner, unitIds, target);
+        sent = executeUnitOrderToNode(OWNER.AI, unitIds, target);
       }
     } else if (order.kind === "point") {
       const x = clamp(Number(order.xRatio) || 0, 0, 1) * state.width;
       const y = clamp(Number(order.yRatio) || 0, 0, 1) * state.height;
-      sent = executeUnitOrderToPoint(order.owner, unitIds, x, y);
+      sent = executeUnitOrderToPoint(OWNER.AI, unitIds, x, y);
     }
 
     if (sent > 0) {
-      state.ai.lastOrder = order.owner === localOwner() ? "local order" : "opponent order";
+      state.ai.lastOrder = "guest order";
+      sendSnapshot(true);
     }
   }
 
@@ -3204,42 +3179,23 @@
     }
   }
 
-  function stepPlayingSimulation(dt) {
-    if (isMultiplayerMatch()) {
-      processPendingOrders();
-    }
-
-    state.elapsed += dt;
-    updateNodes(dt);
-    updateUnits(dt);
-    resolveGuardInterceptions();
-    updateAi(dt);
-    checkWinLoss();
-
-    if (isMultiplayerMatch()) {
-      state.simTick += 1;
-    }
-  }
-
   function update(dt) {
-    if (state.phase === "playing") {
-      if (isMultiplayerMatch()) {
-        state.simAccumulator = Math.min(
-          state.simAccumulator + dt,
-          SIMULATION_STEP * MAX_SIMULATION_STEPS,
-        );
-        while (state.simAccumulator >= SIMULATION_STEP) {
-          stepPlayingSimulation(SIMULATION_STEP);
-          state.simAccumulator -= SIMULATION_STEP;
-        }
-      } else {
-        stepPlayingSimulation(dt);
+    if (isMultiplayerClient()) {
+      if (state.phase === "playing") {
+        updateClientVisuals(dt);
+      } else if (state.phase === "ended") {
+        updateClientVisuals(dt * 0.25);
       }
-    } else if (state.phase !== "menu" && !isMultiplayerMatch()) {
-      const visualDt = dt * 0.25;
-      state.elapsed += visualDt;
-      updateUnits(visualDt);
+    } else if (state.phase === "playing") {
+      updateNodes(dt);
+      updateUnits(dt);
+      resolveGuardInterceptions();
+      updateAi(dt);
+      checkWinLoss();
+    } else if (state.phase !== "menu") {
+      updateUnits(dt * 0.25);
     }
+    updateNetwork(dt);
     updateHud();
   }
 
