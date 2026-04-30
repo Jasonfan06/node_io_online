@@ -33,10 +33,12 @@
   const NETWORK_PROTOCOL = "node-field-v1";
   const SERVER_URL = resolveServerUrl();
   const ROOM_PARAM = "room";
-  const SNAPSHOT_INTERVAL = 0.08;
   const JOIN_TIMEOUT_MS = 10000;
   const COUNTDOWN_STEP_MS = 800;
   const COUNTDOWN_STEPS = ["3", "2", "1", "Start!"];
+  const SIMULATION_STEP = 1 / 60;
+  const MAX_SIMULATION_STEPS = 5;
+  const SHARED_ORDER_DELAY_TICKS = 6;
   const ROOM_MIN = 100000;
   const ROOM_MAX = 999999;
   const AI_DECISION_INTERVAL = 0.28;
@@ -86,25 +88,25 @@
 
   const COLORS = {
     player: {
-      fill: "#dcefe2",
-      line: "#2f7d50",
-      unit: "#23633f",
-      selected: "#1f8f5a",
-      text: "#1f5135",
+      fill: "#eaf4ff",
+      line: "#0066cc",
+      unit: "#0066cc",
+      selected: "#0071e3",
+      text: "#004b9b",
     },
     ai: {
-      fill: "#f2ded9",
-      line: "#b84d3d",
-      unit: "#993a2e",
-      selected: "#b84d3d",
-      text: "#743027",
+      fill: "#f5f5f7",
+      line: "#1d1d1f",
+      unit: "#333333",
+      selected: "#1d1d1f",
+      text: "#1d1d1f",
     },
     neutral: {
-      fill: "#ece8dc",
-      line: "#8d877b",
-      unit: "#8d877b",
-      selected: "#8d877b",
-      text: "#5f5a52",
+      fill: "#ffffff",
+      line: "#d2d2d7",
+      unit: "#7a7a7a",
+      selected: "#7a7a7a",
+      text: "#7a7a7a",
     },
   };
 
@@ -113,8 +115,12 @@
     height: 0,
     dpr: 1,
     lastTime: performance.now(),
+    elapsed: 0,
+    simAccumulator: 0,
+    simTick: 0,
     nodes: [],
     units: [],
+    pendingOrders: [],
     selected: new Set(),
     nextNodeId: 1,
     nextUnitId: 1,
@@ -135,12 +141,9 @@
       isHost: true,
       connected: false,
       roomId: null,
-      peer: null,
       conn: null,
       closing: false,
-      joinAttempts: 0,
       joinTimer: null,
-      snapshotElapsed: 0,
       clientId:
         typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
           ? crypto.randomUUID()
@@ -154,8 +157,6 @@
       y: 0,
       startX: 0,
       startY: 0,
-      circleAxisX: 0,
-      circleAxisY: 0,
       hoverNode: null,
     },
   };
@@ -223,8 +224,12 @@
     return BASE_PRODUCTION_RATE + Math.log1p(Math.max(0, hp)) * HP_PRODUCTION_LOG_WEIGHT;
   }
 
+  function maxStationedForHp(hp) {
+    return Math.round(28 + Math.max(0, hp) * 1.6);
+  }
+
   function maxStationedUnits(node) {
-    return Math.round(28 + Math.max(0, node.hp) * 1.6);
+    return maxStationedForHp(node.hp);
   }
 
   function movementSpeed() {
@@ -233,6 +238,14 @@
 
   function stationBandPadding() {
     return rand(FRIENDLY_STATION_MIN, FRIENDLY_STATION_MAX);
+  }
+
+  function randomDirection() {
+    return state.rng() > 0.5 ? 1 : -1;
+  }
+
+  function randomOrbitSpeed(min, max) {
+    return rand(min, max) * randomDirection();
   }
 
   function nodeStationPoint(node, angle, padding) {
@@ -273,6 +286,12 @@
     return state.units.filter((unit) => unit.owner === owner).length;
   }
 
+  function unitCountByState(owner, unitState) {
+    return state.units.filter(
+      (unit) => unit.owner === owner && unit.state === unitState,
+    ).length;
+  }
+
   function localOwner() {
     return state.match.localOwner;
   }
@@ -306,8 +325,8 @@
     return owner === localOwner() ? COLORS.player : COLORS.ai;
   }
 
-  function isMultiplayerClient() {
-    return state.match.mode === "multi" && !state.match.isHost;
+  function isMultiplayerMatch() {
+    return state.match.mode === "multi";
   }
 
   function isAiEnabled() {
@@ -474,7 +493,7 @@
       angle,
       orbitBlend: 1,
       orbitRadius,
-      orbitSpeed: rand(0.18, 0.38) * (Math.random() > 0.5 ? 1 : -1),
+      orbitSpeed: randomOrbitSpeed(0.18, 0.38),
       speed: movementSpeed(),
       selected: false,
       ordered: false,
@@ -496,12 +515,15 @@
     setRandomSeed(seed);
     state.nodes = [];
     state.units = [];
+    state.pendingOrders = [];
     state.selected.clear();
     state.nextNodeId = 1;
     state.nextUnitId = 1;
+    state.elapsed = 0;
+    state.simAccumulator = 0;
+    state.simTick = 0;
     state.phase = options.phase ?? "playing";
     state.winner = null;
-    state.match.snapshotElapsed = 0;
     state.ai.elapsed = 0;
     state.ai.lastOrder = state.match.mode === "multi" ? "multiplayer" : "opening";
     messageEl.classList.remove("countdown-message", "countdown-pop");
@@ -557,19 +579,11 @@
     return toWorldPoint(x, y);
   }
 
-  function dragCircleFromLockedEdge(startX, startY, endX, endY, axisX, axisY) {
-    const dx = endX - startX;
-    const dy = endY - startY;
-    const hasLockedAxis = Math.hypot(axisX, axisY) > 0;
-    const axisLength = hasLockedAxis ? Math.hypot(axisX, axisY) : Math.hypot(dx, dy) || 1;
-    const ux = (hasLockedAxis ? axisX : dx) / axisLength;
-    const uy = (hasLockedAxis ? axisY : dy) / axisLength;
-    const diameter = Math.max(0, dx * ux + dy * uy);
-
+  function dragCircleFromCenter(startX, startY, endX, endY) {
     return {
-      x: startX + ux * diameter * 0.5,
-      y: startY + uy * diameter * 0.5,
-      radius: diameter * 0.5,
+      x: startX,
+      y: startY,
+      radius: distance(startX, startY, endX, endY),
     };
   }
 
@@ -710,22 +724,23 @@
       return;
     }
 
-    if (isMultiplayerClient()) {
-      executeUnitOrderToNode(localOwner(), unitIds, target);
-      sendNetworkMessage({
+    if (isMultiplayerMatch()) {
+      if (sendNetworkMessage({
         type: "order",
         order: {
           kind: "node",
           owner: localOwner(),
           unitIds,
           targetId: target.id,
+          applyTick: state.simTick + SHARED_ORDER_DELAY_TICKS,
         },
-      });
-    } else {
-      executeUnitOrderToNode(localOwner(), unitIds, target);
-      sendSnapshot(true);
+      })) {
+        clearSelection();
+      }
+      return;
     }
 
+    executeUnitOrderToNode(localOwner(), unitIds, target);
     clearSelection();
   }
 
@@ -736,9 +751,8 @@
       return;
     }
 
-    if (isMultiplayerClient()) {
-      executeUnitOrderToPoint(localOwner(), unitIds, x, y);
-      sendNetworkMessage({
+    if (isMultiplayerMatch()) {
+      if (sendNetworkMessage({
         type: "order",
         order: {
           kind: "point",
@@ -746,13 +760,15 @@
           unitIds,
           xRatio: clamp(x / Math.max(1, state.width), 0, 1),
           yRatio: clamp(y / Math.max(1, state.height), 0, 1),
+          applyTick: state.simTick + SHARED_ORDER_DELAY_TICKS,
         },
-      });
-    } else {
-      executeUnitOrderToPoint(localOwner(), unitIds, x, y);
-      sendSnapshot(true);
+      })) {
+        clearSelection();
+      }
+      return;
     }
 
+    executeUnitOrderToPoint(localOwner(), unitIds, x, y);
     clearSelection();
   }
 
@@ -782,7 +798,7 @@
     unit.angle = currentAngle + (options.preserveOrbit ? 0 : rand(-0.22, 0.22));
     unit.orbitBlend = options.preserveOrbit ? 0 : 1;
     unit.orbitRadius = orbitRadius;
-    unit.orbitSpeed = rand(0.18, 0.38) * (Math.random() > 0.5 ? 1 : -1);
+    unit.orbitSpeed = randomOrbitSpeed(0.18, 0.38);
     unit.selected = false;
     unit.trail = [];
   }
@@ -800,7 +816,7 @@
     unit.ordered = false;
     unit.angle = Math.atan2(unit.y - y, unit.x - x) + rand(-0.28, 0.28);
     unit.orbitRadius = rand(GUARD_HOVER_MIN, GUARD_HOVER_MAX);
-    unit.orbitSpeed = rand(0.12, 0.24) * (Math.random() > 0.5 ? 1 : -1);
+    unit.orbitSpeed = randomOrbitSpeed(0.12, 0.24);
     unit.selected = false;
     unit.trail = [];
   }
@@ -882,6 +898,36 @@
     resolveEnemyArrival(unit, node);
   }
 
+  function updateStationedUnitVisual(unit, dt) {
+    const node = getNode(unit.nodeId);
+    if (!node || node.owner !== unit.owner) {
+      return false;
+    }
+
+    const orbitBlend = unit.orbitBlend ?? 1;
+    unit.angle += unit.orbitSpeed * dt * orbitBlend;
+    unit.orbitRadius +=
+      (node.radius + 15 - unit.orbitRadius) * dt * 0.2 * orbitBlend;
+    unit.orbitBlend = clamp(orbitBlend + dt * 2.4, 0, 1);
+    const wobble = Math.sin(state.elapsed * 1.4 + unit.id) * 1.4 * orbitBlend;
+    unit.x = node.x + Math.cos(unit.angle) * (unit.orbitRadius + wobble);
+    unit.y = node.y + Math.sin(unit.angle) * (unit.orbitRadius + wobble);
+    return true;
+  }
+
+  function updateGuardingUnitVisual(unit, dt) {
+    if (unit.guardX === null || unit.guardY === null) {
+      return false;
+    }
+
+    unit.angle += unit.orbitSpeed * dt;
+    const wobble = Math.sin(state.elapsed * 1.3 + unit.id) * 0.45;
+    const hoverRadius = Math.max(0.5, unit.orbitRadius + wobble);
+    unit.x = unit.guardX + Math.cos(unit.angle) * hoverRadius;
+    unit.y = unit.guardY + Math.sin(unit.angle) * hoverRadius;
+    return true;
+  }
+
   function updateNodes(dt) {
     state.nodes.forEach((node) => {
       node.flash = Math.max(0, node.flash - dt * 2.2);
@@ -915,34 +961,16 @@
       }
 
       if (unit.state === "stationed") {
-        const node = getNode(unit.nodeId);
-        if (!node || node.owner !== unit.owner) {
+        if (!updateStationedUnitVisual(unit, dt)) {
           removeUnit(unit);
-          return;
         }
-
-        const orbitBlend = unit.orbitBlend ?? 1;
-        unit.angle += unit.orbitSpeed * dt * orbitBlend;
-        unit.orbitRadius +=
-          (node.radius + 15 - unit.orbitRadius) * dt * 0.2 * orbitBlend;
-        unit.orbitBlend = clamp(orbitBlend + dt * 2.4, 0, 1);
-        const wobble = Math.sin(performance.now() * 0.0014 + unit.id) * 1.4 * orbitBlend;
-        unit.x = node.x + Math.cos(unit.angle) * (unit.orbitRadius + wobble);
-        unit.y = node.y + Math.sin(unit.angle) * (unit.orbitRadius + wobble);
         return;
       }
 
       if (unit.state === "guarding") {
-        if (unit.guardX === null || unit.guardY === null) {
+        if (!updateGuardingUnitVisual(unit, dt)) {
           removeUnit(unit);
-          return;
         }
-
-        unit.angle += unit.orbitSpeed * dt;
-        const wobble = Math.sin(performance.now() * 0.0013 + unit.id) * 0.45;
-        const hoverRadius = Math.max(0.5, unit.orbitRadius + wobble);
-        unit.x = unit.guardX + Math.cos(unit.angle) * hoverRadius;
-        unit.y = unit.guardY + Math.sin(unit.angle) * hoverRadius;
         return;
       }
 
@@ -1031,32 +1059,12 @@
 
     state.units.forEach((unit) => {
       if (unit.state === "stationed") {
-        const node = getNode(unit.nodeId);
-        if (!node || node.owner !== unit.owner) {
-          return;
-        }
-
-        const orbitBlend = unit.orbitBlend ?? 1;
-        unit.angle += unit.orbitSpeed * dt * orbitBlend;
-        unit.orbitRadius +=
-          (node.radius + 15 - unit.orbitRadius) * dt * 0.2 * orbitBlend;
-        unit.orbitBlend = clamp(orbitBlend + dt * 2.4, 0, 1);
-        const wobble = Math.sin(performance.now() * 0.0014 + unit.id) * 1.4 * orbitBlend;
-        unit.x = node.x + Math.cos(unit.angle) * (unit.orbitRadius + wobble);
-        unit.y = node.y + Math.sin(unit.angle) * (unit.orbitRadius + wobble);
+        updateStationedUnitVisual(unit, dt);
         return;
       }
 
       if (unit.state === "guarding") {
-        if (unit.guardX === null || unit.guardY === null) {
-          return;
-        }
-
-        unit.angle += unit.orbitSpeed * dt;
-        const wobble = Math.sin(performance.now() * 0.0013 + unit.id) * 0.45;
-        const hoverRadius = Math.max(0.5, unit.orbitRadius + wobble);
-        unit.x = unit.guardX + Math.cos(unit.angle) * hoverRadius;
-        unit.y = unit.guardY + Math.sin(unit.angle) * hoverRadius;
+        updateGuardingUnitVisual(unit, dt);
         return;
       }
 
@@ -1163,10 +1171,6 @@
 
   function productionRateFor(owner, hp) {
     return owner === OWNER.NEUTRAL ? 0 : productionRateFromHp(hp);
-  }
-
-  function maxStationedForHp(hp) {
-    return Math.round(28 + Math.max(0, hp) * 1.6);
   }
 
   function travelTimeBetween(a, b) {
@@ -2327,12 +2331,23 @@
     messageEl.hidden = false;
   }
 
-  function finishMatch(winner) {
+  function finishMatch(winner, announce = true) {
+    if (winner !== OWNER.PLAYER && winner !== OWNER.AI) {
+      return;
+    }
+
+    if (state.phase === "ended" && state.winner) {
+      return;
+    }
+
     state.phase = "ended";
     state.winner = winner;
     updateResultMessage();
     clearSelection();
-    sendSnapshot(true);
+
+    if (announce && isMultiplayerMatch()) {
+      sendNetworkMessage({ type: "matchEnded", winner });
+    }
   }
 
   function checkWinLoss() {
@@ -2371,6 +2386,7 @@
     clearCountdown();
     const token = state.countdown.token;
     state.phase = "countdown";
+    state.simAccumulator = 0;
     clearSelection();
 
     let index = 0;
@@ -2385,6 +2401,7 @@
         messageEl.hidden = true;
         state.phase = "playing";
         state.lastTime = performance.now();
+        state.simAccumulator = 0;
         if (typeof onComplete === "function") {
           onComplete();
         }
@@ -2408,16 +2425,18 @@
   }
 
   function showHomeScreen(visible) {
+    const wasHidden = homeScreen.hidden;
     homeScreen.hidden = !visible;
     shell.dataset.screen = visible ? "home" : "game";
     homeScreen.classList.remove("home-entering");
-    if (visible) {
+    if (visible && wasHidden) {
       homeScreen.offsetWidth;
       homeScreen.classList.add("home-entering");
     }
   }
 
   function showMainMenu() {
+    shell.dataset.menu = "main";
     modeActionsEl.hidden = false;
     multiplayerPanelEl.hidden = true;
     roomCardEl.hidden = true;
@@ -2426,7 +2445,8 @@
     showHomeScreen(true);
   }
 
-  function showMultiplayerMenu(message = "Room setup", tone = "normal") {
+  function showMultiplayerMenu(message = "", tone = "normal") {
+    shell.dataset.menu = "multi";
     modeActionsEl.hidden = true;
     multiplayerPanelEl.hidden = false;
     setJoinControlsVisible(true);
@@ -2541,10 +2561,7 @@
     state.match.connected = false;
     state.match.roomId = null;
     state.match.conn = null;
-    state.match.peer = null;
     state.match.closing = false;
-    state.match.joinAttempts = 0;
-    state.match.snapshotElapsed = 0;
   }
 
   function closeNetwork() {
@@ -2571,9 +2588,7 @@
 
     state.match.connected = false;
     state.match.conn = null;
-    state.match.peer = null;
     state.match.closing = false;
-    state.match.snapshotElapsed = 0;
   }
 
   function sendNetworkMessage(message) {
@@ -2593,6 +2608,8 @@
     return {
       width: state.width,
       height: state.height,
+      elapsed: state.elapsed,
+      simTick: state.simTick,
       phase: state.phase,
       winner: state.winner,
       nextNodeId: state.nextNodeId,
@@ -2665,6 +2682,9 @@
 
     const scaleX = state.width / Math.max(1, snapshot.width || state.width);
     const scaleY = state.height / Math.max(1, snapshot.height || state.height);
+    state.elapsed = Number.isFinite(snapshot.elapsed) ? snapshot.elapsed : 0;
+    state.simTick = Number.isFinite(snapshot.simTick) ? snapshot.simTick : 0;
+    state.simAccumulator = 0;
     state.phase = snapshot.phase;
     state.winner = snapshot.winner || null;
     state.nextNodeId = snapshot.nextNodeId || 1;
@@ -2731,43 +2751,6 @@
       messageEl.hidden = true;
     }
     updateHud();
-  }
-
-  function sendSnapshot(force = false) {
-    if (
-      state.match.mode !== "multi" ||
-      !state.match.isHost ||
-      !state.match.connected ||
-      !state.match.conn
-    ) {
-      return;
-    }
-
-    if (!force && state.match.snapshotElapsed < SNAPSHOT_INTERVAL) {
-      return;
-    }
-
-    sendNetworkMessage({
-      type: "snapshot",
-      snapshot: serializeState(),
-    });
-    state.match.snapshotElapsed = 0;
-  }
-
-  function updateNetwork(dt) {
-    if (
-      state.match.mode !== "multi" ||
-      !state.match.isHost ||
-      !state.match.connected ||
-      (state.phase !== "playing" && state.phase !== "ended")
-    ) {
-      return;
-    }
-
-    state.match.snapshotElapsed += dt;
-    if (state.match.snapshotElapsed >= SNAPSHOT_INTERVAL) {
-      sendSnapshot(true);
-    }
   }
 
   function ensureSocketSupport() {
@@ -2912,9 +2895,8 @@
 
   function startHostCountdown() {
     showHomeScreen(false);
-    startCountdown(() => {
-      sendSnapshot(true);
-    });
+    state.phase = "countdown";
+    clearSelection();
     sendInitSnapshot();
   }
 
@@ -2969,28 +2951,35 @@
       return;
     }
 
-    if (message.type === "init" && !state.match.isHost) {
+    if (message.type === "init" && isMultiplayerMatch()) {
       const wasCounting =
         state.phase === "countdown" &&
         !messageEl.hidden &&
         messageEl.classList.contains("countdown-message");
       state.match.roomId = message.roomId || state.match.roomId;
-      applySnapshot(message.snapshot);
       state.match.connected = true;
+      state.pendingOrders = [];
+      applySnapshot(message.snapshot);
       showHomeScreen(false);
       if (state.phase === "countdown" && !wasCounting) {
         startCountdown();
       }
+      updateHud();
       return;
     }
 
-    if (message.type === "snapshot" && !state.match.isHost) {
+    if (message.type === "snapshot" && isMultiplayerMatch()) {
       applySnapshot(message.snapshot);
       return;
     }
 
-    if (message.type === "order" && state.match.isHost) {
-      handleRemoteOrder(message.order);
+    if (message.type === "order" && isMultiplayerMatch()) {
+      queueSharedOrder(message.order, message.sequence);
+      return;
+    }
+
+    if (message.type === "matchEnded" && isMultiplayerMatch()) {
+      finishMatch(message.winner, false);
       return;
     }
 
@@ -3003,7 +2992,7 @@
       if (state.match.isHost) {
         showHostWaitingRoom(state.match.roomId);
       } else {
-        showMultiplayerMenu("Host disconnected", "error");
+        showMultiplayerMenu("Opponent disconnected", "error");
       }
       updateHud();
       return;
@@ -3014,8 +3003,39 @@
     }
   }
 
-  function handleRemoteOrder(order) {
-    if (!order || order.owner !== OWNER.AI || state.phase !== "playing") {
+  function queueSharedOrder(order, sequence = 0) {
+    if (!order || (order.owner !== OWNER.PLAYER && order.owner !== OWNER.AI)) {
+      return;
+    }
+
+    const applyTick = Number.isFinite(order.applyTick)
+      ? Math.max(0, Math.floor(order.applyTick))
+      : state.simTick;
+
+    state.pendingOrders.push({
+      order,
+      applyTick,
+      sequence: Number.isFinite(sequence) ? sequence : 0,
+    });
+    state.pendingOrders.sort((a, b) => a.applyTick - b.applyTick || a.sequence - b.sequence);
+  }
+
+  function processPendingOrders() {
+    while (
+      state.pendingOrders.length > 0 &&
+      state.pendingOrders[0].applyTick <= state.simTick
+    ) {
+      const next = state.pendingOrders.shift();
+      handleSharedOrder(next.order);
+    }
+  }
+
+  function handleSharedOrder(order) {
+    if (
+      !order ||
+      (order.owner !== OWNER.PLAYER && order.owner !== OWNER.AI) ||
+      state.phase !== "playing"
+    ) {
       return;
     }
 
@@ -3030,17 +3050,16 @@
     if (order.kind === "node") {
       const target = getNode(Number(order.targetId));
       if (target) {
-        sent = executeUnitOrderToNode(OWNER.AI, unitIds, target);
+        sent = executeUnitOrderToNode(order.owner, unitIds, target);
       }
     } else if (order.kind === "point") {
       const x = clamp(Number(order.xRatio) || 0, 0, 1) * state.width;
       const y = clamp(Number(order.yRatio) || 0, 0, 1) * state.height;
-      sent = executeUnitOrderToPoint(OWNER.AI, unitIds, x, y);
+      sent = executeUnitOrderToPoint(order.owner, unitIds, x, y);
     }
 
     if (sent > 0) {
-      state.ai.lastOrder = "guest order";
-      sendSnapshot(true);
+      state.ai.lastOrder = order.owner === localOwner() ? "local order" : "opponent order";
     }
   }
 
@@ -3053,7 +3072,6 @@
     state.match.localOwner = OWNER.PLAYER;
     state.match.isHost = true;
     state.match.roomId = roomId;
-    state.match.joinAttempts = 1;
     state.phase = "menu";
     showMultiplayerMenu("Room not found", "error");
     setRoomCard(null);
@@ -3111,23 +3129,17 @@
     const aiNodes = controlledNodeCount(OWNER.AI);
     const playerUnits = unitCount(OWNER.PLAYER);
     const aiUnits = unitCount(OWNER.AI);
-    const movingPlayerCount = state.units.filter(
-      (unit) => unit.owner === OWNER.PLAYER && unit.state === "moving",
-    ).length;
-    const movingAiCount = state.units.filter(
-      (unit) => unit.owner === OWNER.AI && unit.state === "moving",
-    ).length;
-    const guardingPlayerCount = state.units.filter(
-      (unit) => unit.owner === OWNER.PLAYER && unit.state === "guarding",
-    ).length;
-    const guardingAiCount = state.units.filter(
-      (unit) => unit.owner === OWNER.AI && unit.state === "guarding",
-    ).length;
+    const nodeCounts = ownerCounts(playerNodes, aiNodes);
+    const unitCounts = ownerCounts(playerUnits, aiUnits);
+    const movingPlayerCount = unitCountByState(OWNER.PLAYER, "moving");
+    const movingAiCount = unitCountByState(OWNER.AI, "moving");
+    const guardingPlayerCount = unitCountByState(OWNER.PLAYER, "guarding");
+    const guardingAiCount = unitCountByState(OWNER.AI, "guarding");
     const ownOwner = localOwner();
     const foeOwner = enemyOwner();
 
-    nodeScoreEl.textContent = `${controlledNodeCount(ownOwner)} - ${controlledNodeCount(foeOwner)}`;
-    unitScoreEl.textContent = `${unitCount(ownOwner)} - ${unitCount(foeOwner)}`;
+    nodeScoreEl.textContent = `${nodeCounts[ownOwner]} - ${nodeCounts[foeOwner]}`;
+    unitScoreEl.textContent = `${unitCounts[ownOwner]} - ${unitCounts[foeOwner]}`;
     selectedEl.textContent = String(state.selected.size);
     shell.dataset.phase = state.phase;
     shell.dataset.mode = state.match.mode;
@@ -3192,48 +3204,49 @@
     }
   }
 
-  function update(dt) {
-    if (isMultiplayerClient()) {
-      if (state.phase === "playing") {
-        updateClientVisuals(dt);
-      } else if (state.phase === "ended") {
-        updateClientVisuals(dt * 0.25);
-      }
-    } else if (state.phase === "playing") {
-      updateNodes(dt);
-      updateUnits(dt);
-      resolveGuardInterceptions();
-      updateAi(dt);
-      checkWinLoss();
-    } else if (state.phase !== "menu") {
-      updateUnits(dt * 0.25);
+  function stepPlayingSimulation(dt) {
+    if (isMultiplayerMatch()) {
+      processPendingOrders();
     }
-    updateNetwork(dt);
+
+    state.elapsed += dt;
+    updateNodes(dt);
+    updateUnits(dt);
+    resolveGuardInterceptions();
+    updateAi(dt);
+    checkWinLoss();
+
+    if (isMultiplayerMatch()) {
+      state.simTick += 1;
+    }
+  }
+
+  function update(dt) {
+    if (state.phase === "playing") {
+      if (isMultiplayerMatch()) {
+        state.simAccumulator = Math.min(
+          state.simAccumulator + dt,
+          SIMULATION_STEP * MAX_SIMULATION_STEPS,
+        );
+        while (state.simAccumulator >= SIMULATION_STEP) {
+          stepPlayingSimulation(SIMULATION_STEP);
+          state.simAccumulator -= SIMULATION_STEP;
+        }
+      } else {
+        stepPlayingSimulation(dt);
+      }
+    } else if (state.phase !== "menu" && !isMultiplayerMatch()) {
+      const visualDt = dt * 0.25;
+      state.elapsed += visualDt;
+      updateUnits(visualDt);
+    }
     updateHud();
   }
 
   function drawBackground() {
     ctx.clearRect(0, 0, state.width, state.height);
-    ctx.fillStyle = "#f7f4ec";
+    ctx.fillStyle = "#f5f5f7";
     ctx.fillRect(0, 0, state.width, state.height);
-
-    ctx.save();
-    ctx.strokeStyle = "rgba(68, 64, 58, 0.045)";
-    ctx.lineWidth = 1;
-    const spacing = 48;
-    for (let x = 0; x <= state.width; x += spacing) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, state.height);
-      ctx.stroke();
-    }
-    for (let y = 0; y <= state.height; y += spacing) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(state.width, y);
-      ctx.stroke();
-    }
-    ctx.restore();
   }
 
   function drawNode(node) {
@@ -3276,7 +3289,7 @@
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillStyle = colors.text;
-    ctx.font = "700 16px Inter, system-ui, sans-serif";
+    ctx.font = '600 16px "SF Pro Text", system-ui, -apple-system, sans-serif';
     ctx.fillText(text, point.x, point.y);
     ctx.restore();
   }
@@ -3289,8 +3302,8 @@
     if (unit.state === "moving" && unit.trail.length > 1) {
       ctx.lineWidth = 1;
       ctx.strokeStyle = unit.owner === localOwner()
-        ? "rgba(35, 99, 63, 0.38)"
-        : "rgba(153, 58, 46, 0.34)";
+        ? "rgba(0, 102, 204, 0.36)"
+        : "rgba(29, 29, 31, 0.24)";
       const trailStart = toViewPoint(unit.trail[0].x, unit.trail[0].y);
       ctx.beginPath();
       ctx.moveTo(trailStart.x, trailStart.y);
@@ -3307,7 +3320,7 @@
     ctx.fill();
 
     if (unit.selected) {
-      ctx.strokeStyle = "#2f6fab";
+      ctx.strokeStyle = "#0071e3";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.arc(point.x, point.y, 7, 0, TAU);
@@ -3322,7 +3335,7 @@
       const node = state.mouse.hoverNode;
       const point = toViewPoint(node.x, node.y);
       ctx.save();
-      ctx.strokeStyle = "#2f6fab";
+      ctx.strokeStyle = "#0071e3";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.arc(point.x, point.y, node.radius + 12, 0, TAU);
@@ -3340,7 +3353,7 @@
         const from = toViewPoint(cx, cy);
         const to = toViewPoint(state.mouse.hoverNode.x, state.mouse.hoverNode.y);
         ctx.save();
-        ctx.strokeStyle = "rgba(47, 111, 171, 0.42)";
+        ctx.strokeStyle = "rgba(0, 102, 204, 0.42)";
         ctx.lineWidth = 1.2;
         ctx.setLineDash([5, 7]);
         ctx.beginPath();
@@ -3352,18 +3365,16 @@
     }
 
     if (state.mouse.down && state.mouse.dragging) {
-      const circle = dragCircleFromLockedEdge(
+      const circle = dragCircleFromCenter(
         state.mouse.startX,
         state.mouse.startY,
         state.mouse.x,
         state.mouse.y,
-        state.mouse.circleAxisX,
-        state.mouse.circleAxisY,
       );
       const point = toViewPoint(circle.x, circle.y);
       ctx.save();
-      ctx.fillStyle = "rgba(47, 111, 171, 0.08)";
-      ctx.strokeStyle = "#2f6fab";
+      ctx.fillStyle = "rgba(0, 102, 204, 0.08)";
+      ctx.strokeStyle = "#0071e3";
       ctx.lineWidth = 1.8;
       ctx.beginPath();
       ctx.arc(point.x, point.y, circle.radius, 0, TAU);
@@ -3402,8 +3413,6 @@
     state.mouse.y = point.y;
     state.mouse.startX = point.x;
     state.mouse.startY = point.y;
-    state.mouse.circleAxisX = 0;
-    state.mouse.circleAxisY = 0;
     canvas.setPointerCapture(event.pointerId);
   });
 
@@ -3425,8 +3434,6 @@
     );
     if (dragDistance > 5 && !state.mouse.dragging) {
       state.mouse.dragging = true;
-      state.mouse.circleAxisX = (state.mouse.x - state.mouse.startX) / dragDistance;
-      state.mouse.circleAxisY = (state.mouse.y - state.mouse.startY) / dragDistance;
     }
   });
 
@@ -3444,13 +3451,11 @@
     );
 
     if (state.mouse.dragging && dragDistance > 10) {
-      const circle = dragCircleFromLockedEdge(
+      const circle = dragCircleFromCenter(
         state.mouse.startX,
         state.mouse.startY,
         point.x,
         point.y,
-        state.mouse.circleAxisX,
-        state.mouse.circleAxisY,
       );
       selectUnitsInCircle(circle.x, circle.y, circle.radius);
     } else {
@@ -3469,8 +3474,6 @@
     state.mouse.down = false;
     state.mouse.dragging = false;
     state.mouse.id = null;
-    state.mouse.circleAxisX = 0;
-    state.mouse.circleAxisY = 0;
     state.mouse.hoverNode = hitNode(point.x, point.y);
   });
 
@@ -3478,14 +3481,12 @@
     state.mouse.down = false;
     state.mouse.dragging = false;
     state.mouse.id = null;
-    state.mouse.circleAxisX = 0;
-    state.mouse.circleAxisY = 0;
   });
 
   singleplayerEl.addEventListener("click", startSingleplayer);
 
   multiplayerEl.addEventListener("click", () => {
-    showMultiplayerMenu("Room setup");
+    showMultiplayerMenu("");
     roomInputEl.focus();
   });
 

@@ -21,5 +21,5 @@ If you keep the frontend on GitHub Pages and deploy only the server elsewhere, s
 <script>
   window.NODE_FIELD_SERVER_URL = "wss://your-server.example.com";
 </script>
-<script src="./game.js?v=16"></script>
+<script src="./game.js?v=17"></script>
 ```
