@@ -9,7 +9,8 @@
     "ai:train": "node scripts/ai-lab.js train",
     "ai:versus": "node scripts/ai-lab.js versus",
     "ai:invest": "node scripts/ai-lab.js invest",
-    "ai:self": "node scripts/ai-lab.js self"
+    "ai:self": "node scripts/ai-lab.js self",
+    "ai:opening": "node scripts/ai-lab.js opening"
   },
   "dependencies": {
     "ws": "^8.18.0"

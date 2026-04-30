@@ -24,8 +24,6 @@ const TRAINABLE_CONSTANTS = {
   AI_SAFETY_MARGIN: { min: 1, max: 6, step: 1 },
   AI_RESPONSE_DELAY: { min: 0.12, max: 0.5, step: 0.04 },
   AI_EXPANSION_BONUS: { min: 8, max: 34, step: 2 },
-  AI_SINGLEPLAYER_STARTING_UNIT_MULTIPLIER: { min: 1, max: 2.4, step: 0.05 },
-  AI_SINGLEPLAYER_PRODUCTION_MULTIPLIER: { min: 1, max: 2.2, step: 0.05 },
   AI_EXPANSION_VALUE_WEIGHT: { min: 0.7, max: 1.7, step: 0.1 },
   AI_EXPANSION_COST_WEIGHT: { min: 0.9, max: 2.4, step: 0.1 },
   AI_ATTACK_VALUE_WEIGHT: { min: 2.6, max: 5.4, step: 0.2 },
@@ -609,8 +607,8 @@ function runWeakOpponentTurn(api, mode) {
       continue;
     }
 
-    const multiplier = mode === "raider" ? 0.75 : mode === "greedy" ? 1 : 0.85;
-    const count = Math.min(available, Math.ceil(target.cost * multiplier));
+    const commitmentRatio = mode === "raider" ? 0.75 : mode === "greedy" ? 1 : 0.85;
+    const count = Math.min(available, Math.ceil(target.cost * commitmentRatio));
     if (count >= Math.max(1, target.cost * 0.45) && sendFromNode(api, source, target.node, count) > 0) {
       issued += 1;
     }
@@ -808,16 +806,8 @@ function evaluateVersusRefs(source, config, args) {
   };
 }
 
-function selfPlayBaseConfig(config) {
-  return {
-    ...config,
-    AI_SINGLEPLAYER_STARTING_UNIT_MULTIPLIER: 1,
-    AI_SINGLEPLAYER_PRODUCTION_MULTIPLIER: 1,
-  };
-}
-
 function runInvestmentSelfMatch(source, config, seed, enabledSide, options = {}) {
-  const baseConfig = selfPlayBaseConfig(config);
+  const baseConfig = { ...config };
   const enabledConfig = { ...baseConfig, AI_INVEST_ENABLED: 1 };
   const disabledConfig = { ...baseConfig, AI_INVEST_ENABLED: 0 };
   const gameConfig = enabledSide === "ai" ? enabledConfig : disabledConfig;
@@ -922,6 +912,21 @@ function evaluateInvestmentSelfPlay(source, config, args) {
       ai: summarizeSelfMatches(bySide.ai),
       player: summarizeSelfMatches(bySide.player),
     },
+  };
+}
+
+function evaluateOpeningState(source, config, args) {
+  const game = createGame(source, config, `${args.seed}-opening`);
+  game.api.state.match.mode = "single";
+  game.api.state.match.localOwner = game.api.OWNER.PLAYER;
+  game.api.state.match.isHost = true;
+  game.api.state.match.connected = false;
+  game.api.newGame({ seed: `${args.seed}-opening`, phase: "playing" });
+  return {
+    playerNodes: game.api.controlledNodeCount(game.api.OWNER.PLAYER),
+    aiNodes: game.api.controlledNodeCount(game.api.OWNER.AI),
+    playerUnits: game.api.unitCount(game.api.OWNER.PLAYER),
+    aiUnits: game.api.unitCount(game.api.OWNER.AI),
   };
 }
 
@@ -1058,8 +1063,21 @@ function main() {
     return;
   }
 
+  if (args.command === "opening") {
+    const opening = evaluateOpeningState(source, liveConfig, args);
+    console.log(
+      `opening: nodes ${opening.playerNodes}-${opening.aiNodes}, ` +
+        `units ${opening.playerUnits}-${opening.aiUnits}`,
+    );
+    if (opening.playerUnits !== opening.aiUnits) {
+      console.log("Opening unit counts are not equal.");
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   if (args.command !== "train") {
-    console.error("Usage: node scripts/ai-lab.js [eval|train|versus|invest|self] [--games=N] [--opponents=weak,greedy] [--refs=HEAD,42aafc8] [--apply]");
+    console.error("Usage: node scripts/ai-lab.js [eval|train|versus|invest|self|opening] [--games=N] [--opponents=weak,greedy] [--refs=HEAD,42aafc8] [--apply]");
     process.exitCode = 2;
     return;
   }

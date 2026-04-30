@@ -52,8 +52,6 @@
   const AI_EXPANSION_BONUS = 16;
   const AI_MAX_ORDERS = 3;
   const AI_MAX_DEFENSE_ORDERS = 2;
-  const AI_SINGLEPLAYER_STARTING_UNIT_MULTIPLIER = 1.85;
-  const AI_SINGLEPLAYER_PRODUCTION_MULTIPLIER = 1.65;
   const AI_INVEST_ENABLED = 1;
   const AI_INVEST_MIN_SURPLUS = 9;
   const AI_INVEST_MAX_UNITS = 3;
@@ -592,16 +590,6 @@
     }
   }
 
-  function receivesSingleplayerAiAdvantage(owner) {
-    return state.match.mode === "single" && owner === OWNER.AI;
-  }
-
-  function startingUnitCount(owner, count) {
-    return receivesSingleplayerAiAdvantage(owner)
-      ? Math.ceil(count * AI_SINGLEPLAYER_STARTING_UNIT_MULTIPLIER)
-      : count;
-  }
-
   function newGame(options = {}) {
     clearCountdown();
     const seed = options.seed ?? `single-${Date.now()}-${Math.random()}`;
@@ -653,8 +641,8 @@
 
     addStationedUnits(playerHome, OWNER.PLAYER, 22);
     addStationedUnits(playerOutpost, OWNER.PLAYER, 13);
-    addStationedUnits(aiHome, OWNER.AI, startingUnitCount(OWNER.AI, 22));
-    addStationedUnits(aiOutpost, OWNER.AI, startingUnitCount(OWNER.AI, 13));
+    addStationedUnits(aiHome, OWNER.AI, 22);
+    addStationedUnits(aiOutpost, OWNER.AI, 13);
 
     for (let i = state.nodes.length; i < totalNodes; i += 1) {
       placeNode(
@@ -1284,10 +1272,7 @@
     if (owner === OWNER.NEUTRAL) {
       return 0;
     }
-    const multiplier = receivesSingleplayerAiAdvantage(owner)
-      ? AI_SINGLEPLAYER_PRODUCTION_MULTIPLIER
-      : 1;
-    return productionRateFromHp(hp) * multiplier;
+    return productionRateFromHp(hp);
   }
 
   function travelTimeBetween(a, b) {
