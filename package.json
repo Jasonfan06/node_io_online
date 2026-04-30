@@ -4,7 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "ai:eval": "node scripts/ai-lab.js eval",
+    "ai:train": "node scripts/ai-lab.js train",
+    "ai:versus": "node scripts/ai-lab.js versus",
+    "ai:invest": "node scripts/ai-lab.js invest",
+    "ai:self": "node scripts/ai-lab.js self"
   },
   "dependencies": {
     "ws": "^8.18.0"

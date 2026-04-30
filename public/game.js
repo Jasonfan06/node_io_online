@@ -52,6 +52,14 @@
   const AI_EXPANSION_BONUS = 16;
   const AI_MAX_ORDERS = 3;
   const AI_MAX_DEFENSE_ORDERS = 2;
+  const AI_SINGLEPLAYER_STARTING_UNIT_MULTIPLIER = 1.85;
+  const AI_SINGLEPLAYER_PRODUCTION_MULTIPLIER = 1.65;
+  const AI_INVEST_ENABLED = 1;
+  const AI_INVEST_MIN_SURPLUS = 9;
+  const AI_INVEST_MAX_UNITS = 3;
+  const AI_INVEST_FRONT_HP_TARGET = 9;
+  const AI_INVEST_BACK_HP_TARGET = 5;
+  const AI_INVEST_SCORE_BIAS = 14;
   const AI_EXPANSION_VALUE_WEIGHT = 1.05;
   const AI_EXPANSION_COST_WEIGHT = 1.9;
   const AI_EXPANSION_CONTEST_SCALE = 0.06;
@@ -273,23 +281,12 @@
     return clamp(18 + Math.sqrt(Math.max(1, node.hp)) * 3.1 + node.hp * 0.08, 22, 58);
   }
 
-  function productionRate(node) {
-    if (node.owner === OWNER.NEUTRAL) {
-      return 0;
-    }
-    return productionRateFromHp(node.hp);
-  }
-
   function productionRateFromHp(hp) {
     return BASE_PRODUCTION_RATE + Math.log1p(Math.max(0, hp)) * HP_PRODUCTION_LOG_WEIGHT;
   }
 
   function maxStationedForHp(hp) {
     return Math.round(28 + Math.max(0, hp) * 1.6);
-  }
-
-  function maxStationedUnits(node) {
-    return maxStationedForHp(node.hp);
   }
 
   function movementSpeed() {
@@ -301,7 +298,7 @@
   }
 
   function randomDirection() {
-    return Math.random() > 0.5 ? 1 : -1;
+    return state.rng() > 0.5 ? 1 : -1;
   }
 
   function randomOrbitSpeed(min, max) {
@@ -429,15 +426,6 @@
         unit.owner === owner &&
         unit.state === "stationed" &&
         unit.nodeId === nodeId,
-    );
-  }
-
-  function movingUnitsTo(nodeId, owner) {
-    return state.units.filter(
-      (unit) =>
-        unit.owner === owner &&
-        unit.state === "moving" &&
-        unit.targetId === nodeId,
     );
   }
 
@@ -604,6 +592,16 @@
     }
   }
 
+  function receivesSingleplayerAiAdvantage(owner) {
+    return state.match.mode === "single" && owner === OWNER.AI;
+  }
+
+  function startingUnitCount(owner, count) {
+    return receivesSingleplayerAiAdvantage(owner)
+      ? Math.ceil(count * AI_SINGLEPLAYER_STARTING_UNIT_MULTIPLIER)
+      : count;
+  }
+
   function newGame(options = {}) {
     clearCountdown();
     const seed = options.seed ?? `single-${Date.now()}-${Math.random()}`;
@@ -655,8 +653,8 @@
 
     addStationedUnits(playerHome, OWNER.PLAYER, 22);
     addStationedUnits(playerOutpost, OWNER.PLAYER, 13);
-    addStationedUnits(aiHome, OWNER.AI, 22);
-    addStationedUnits(aiOutpost, OWNER.AI, 13);
+    addStationedUnits(aiHome, OWNER.AI, startingUnitCount(OWNER.AI, 22));
+    addStationedUnits(aiOutpost, OWNER.AI, startingUnitCount(OWNER.AI, 13));
 
     for (let i = state.nodes.length; i < totalNodes; i += 1) {
       placeNode(
@@ -1050,14 +1048,14 @@
       }
 
       const stationedCount = stationedUnitsAt(node.id, node.owner).length;
-      if (stationedCount >= maxStationedUnits(node) || state.units.length >= MAX_UNITS) {
+      if (stationedCount >= maxStationedForHp(node.hp) || state.units.length >= MAX_UNITS) {
         return;
       }
 
-      node.production += productionRate(node) * dt;
+      node.production += productionRateFor(node.owner, node.hp) * dt;
       while (
         node.production >= 1 &&
-        stationedUnitsAt(node.id, node.owner).length < maxStationedUnits(node) &&
+        stationedUnitsAt(node.id, node.owner).length < maxStationedForHp(node.hp) &&
         state.units.length < MAX_UNITS
       ) {
         addUnit(node.owner, node);
@@ -1283,7 +1281,13 @@
   }
 
   function productionRateFor(owner, hp) {
-    return owner === OWNER.NEUTRAL ? 0 : productionRateFromHp(hp);
+    if (owner === OWNER.NEUTRAL) {
+      return 0;
+    }
+    const multiplier = receivesSingleplayerAiAdvantage(owner)
+      ? AI_SINGLEPLAYER_PRODUCTION_MULTIPLIER
+      : 1;
+    return productionRateFromHp(hp) * multiplier;
   }
 
   function travelTimeBetween(a, b) {
@@ -2008,8 +2012,57 @@
       .slice(0, 5);
   }
 
-  function generateInvestCandidates() {
-    return [];
+  function generateInvestCandidates(snapshot) {
+    if (!AI_INVEST_ENABLED) {
+      return [];
+    }
+
+    const enemyNodes = snapshot.nodes.filter((node) => node.owner === OWNER.PLAYER);
+    if (!enemyNodes.length) {
+      return [];
+    }
+
+    const neutralCount = snapshot.nodes.filter((node) => node.owner === OWNER.NEUTRAL).length;
+    const aiNodeCount = snapshot.nodes.filter((node) => node.owner === OWNER.AI).length;
+
+    return snapshot.nodes
+      .filter((node) => node.owner === OWNER.AI)
+      .map((node) => {
+        const available = availableFromNode(snapshot, node, OWNER.AI);
+        if (available < AI_INVEST_MIN_SURPLUS) {
+          return null;
+        }
+
+        const closestEnemy = enemyNodes.reduce(
+          (best, enemy) => Math.min(best, travelTimeBetween(node, enemy)),
+          AI_HORIZON,
+        );
+        const frontline = closestEnemy <= AI_HORIZON * 0.55;
+        if (!frontline && neutralCount > 0 && aiNodeCount < 6) {
+          return null;
+        }
+
+        const pressure = potentialThreatTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.65);
+        const targetHp =
+          (frontline ? AI_INVEST_FRONT_HP_TARGET : AI_INVEST_BACK_HP_TARGET) +
+          Math.ceil(pressure * 0.1);
+        const needed = Math.max(0, targetHp - node.hp);
+        const count = Math.min(AI_INVEST_MAX_UNITS, available, needed);
+        if (count <= 0) {
+          return null;
+        }
+
+        return buildFixedSourceOrder(snapshot, OWNER.AI, "invest", node, node, count, {
+          invest: true,
+          scoreBias:
+            AI_INVEST_SCORE_BIAS +
+            count * 4 +
+            (frontline ? 9 : 0) +
+            Math.max(0, pressure) * 0.35,
+        });
+      })
+      .filter(Boolean)
+      .slice(0, 4);
   }
 
   function generateGuardCandidates(snapshot) {
@@ -3151,7 +3204,6 @@
       sendNetworkMessage({
         type: "createRoom",
         roomId,
-        clientId: state.match.clientId,
       });
     });
   }
@@ -3180,7 +3232,6 @@
       sendNetworkMessage({
         type: "joinRoom",
         roomId,
-        clientId: state.match.clientId,
       });
     });
   }
@@ -3306,11 +3357,6 @@
       } else {
         reportRoomNotFound();
       }
-      return;
-    }
-
-    if (message.type === "busy" && !state.match.isHost) {
-      reportNetworkError("Room is full");
       return;
     }
 
