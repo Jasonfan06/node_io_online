@@ -24,6 +24,13 @@ const TRAINABLE_CONSTANTS = {
   AI_SAFETY_MARGIN: { min: 1, max: 6, step: 1 },
   AI_RESPONSE_DELAY: { min: 0.12, max: 0.5, step: 0.04 },
   AI_EXPANSION_BONUS: { min: 8, max: 34, step: 2 },
+  AI_EXPANSION_GARRISON_BASE: { min: 0, max: 5, step: 1 },
+  AI_EXPANSION_GARRISON_FRONT: { min: 1, max: 9, step: 1 },
+  AI_EXPANSION_GARRISON_MAX: { min: 3, max: 12, step: 1 },
+  AI_STABILIZE_SCORE_BIAS: { min: 8, max: 70, step: 2 },
+  AI_STABILIZE_BACK_STRENGTH: { min: 1, max: 8, step: 1 },
+  AI_STABILIZE_FRONT_STRENGTH: { min: 2, max: 10, step: 1 },
+  AI_STABILIZE_MAX_CANDIDATES: { min: 2, max: 10, step: 1 },
   AI_EXPANSION_VALUE_WEIGHT: { min: 0.7, max: 1.7, step: 0.1 },
   AI_EXPANSION_COST_WEIGHT: { min: 0.9, max: 2.4, step: 0.1 },
   AI_ATTACK_VALUE_WEIGHT: { min: 2.6, max: 5.4, step: 0.2 },
@@ -51,6 +58,9 @@ function parseArgs(argv) {
     games: 80,
     generations: 14,
     population: 18,
+    elite: 4,
+    versusGames: 15,
+    versusFitness: true,
     opponents: ["weak", "greedy", "raider", "turtle"],
     refs: [],
     apply: false,
@@ -69,6 +79,12 @@ function parseArgs(argv) {
       args.generations = Math.max(1, Number(value) || args.generations);
     } else if (key === "population") {
       args.population = Math.max(2, Number(value) || args.population);
+    } else if (key === "elite") {
+      args.elite = Math.max(1, Number(value) || args.elite);
+    } else if (key === "versus-games") {
+      args.versusGames = Math.max(0, Number(value) || args.versusGames);
+    } else if (key === "versus-fitness") {
+      args.versusFitness = value !== "false";
     } else if (key === "opponents") {
       args.opponents = value.split(",").map((entry) => entry.trim()).filter(Boolean);
     } else if (key === "refs") {
@@ -1005,8 +1021,68 @@ function mutateConfig(base, rng, scale = 1) {
   return next;
 }
 
-function configFitness(result) {
-  return result.winRate * 100000 + result.averageScore * 20 - result.averageSeconds * 0.4;
+function randomConfig(template, rng) {
+  const next = { ...template };
+  for (const [name, range] of Object.entries(TRAINABLE_CONSTANTS)) {
+    if (!Object.hasOwn(template, name)) {
+      continue;
+    }
+    const steps = Math.round((range.max - range.min) / range.step);
+    next[name] = Number((range.min + Math.floor(rng() * (steps + 1)) * range.step).toFixed(4));
+  }
+  return next;
+}
+
+function crossoverConfig(a, b, rng) {
+  const next = { ...a };
+  for (const name of Object.keys(TRAINABLE_CONSTANTS)) {
+    if (!Object.hasOwn(a, name) || !Object.hasOwn(b, name)) {
+      continue;
+    }
+    if (rng() < 0.5) {
+      next[name] = b[name];
+    }
+  }
+  return next;
+}
+
+function configKey(config) {
+  return Object.keys(TRAINABLE_CONSTANTS)
+    .filter((name) => Object.hasOwn(config, name))
+    .map((name) => `${name}:${config[name]}`)
+    .join("|");
+}
+
+function resultFloorRate(result) {
+  const opponentRates = Object.values(result.byOpponent || {}).map((entry) => entry.winRate);
+  if (opponentRates.length > 0) {
+    return Math.min(...opponentRates);
+  }
+  const refRates = Object.values(result.refs || {}).map((entry) => entry.winRate);
+  if (refRates.length > 0) {
+    return Math.min(...refRates);
+  }
+  return result.winRate;
+}
+
+function configFitness(result, versusResult = null) {
+  const weakestOpponentRate = resultFloorRate(result);
+  const versusWinRate = versusResult ? versusResult.winRate : 0;
+  const weakestVersusRate = versusResult ? resultFloorRate(versusResult) : 0;
+  const versusScore = versusResult ? versusResult.averageScore : 0;
+  const versusLosses = versusResult ? versusResult.losses : 0;
+
+  return (
+    result.winRate * 100000 +
+    weakestOpponentRate * 65000 +
+    versusWinRate * 85000 +
+    weakestVersusRate * 45000 +
+    result.averageScore * 25 +
+    versusScore * 18 -
+    result.averageSeconds * 0.35 -
+    result.losses * 500 -
+    versusLosses * 900
+  );
 }
 
 function printConfig(config) {
@@ -1017,6 +1093,51 @@ function printConfig(config) {
 
 function applyConfig(source, config) {
   fs.writeFileSync(GAME_PATH, patchConstants(source, config));
+}
+
+function evaluateCandidate(source, config, args) {
+  const result = evaluateConfig(source, config, args);
+  const versusResult =
+    args.versusFitness && args.versusGames > 0
+      ? evaluateVersusRefs(source, config, {
+          ...args,
+          games: args.versusGames,
+        })
+      : null;
+  return {
+    config,
+    result,
+    versusResult,
+    fitness: configFitness(result, versusResult),
+  };
+}
+
+function buildEvolutionCandidate(elites, liveConfig, rng, generation, generations) {
+  if (elites.length === 0 || rng() < (generation <= 2 ? 0.45 : 0.25)) {
+    return randomConfig(liveConfig, rng);
+  }
+
+  const parentA = elites[Math.floor(rng() * elites.length)].config;
+  const parentB = elites[Math.floor(rng() * elites.length)].config;
+  const mixed = crossoverConfig(parentA, parentB, rng);
+  const scale = generation <= 2 ? 3 : Math.max(0.6, 1.8 - generation / Math.max(1, generations));
+  return mutateConfig(mixed, rng, scale);
+}
+
+function printEvolutionGeneration(generation, leader, elites) {
+  printResult(`generation ${String(generation).padStart(2, "0")}`, leader.result);
+  if (leader.versusResult) {
+    printVersusResult(
+      `generation ${String(generation).padStart(2, "0")} leader previous-AI fitness`,
+      leader.versusResult,
+    );
+  }
+  console.log(
+    `  top fitness: ${elites
+      .slice(0, Math.min(3, elites.length))
+      .map((entry) => entry.fitness.toFixed(0))
+      .join(", ")}`,
+  );
 }
 
 function main() {
@@ -1083,33 +1204,56 @@ function main() {
   }
 
   const rng = makeRng(args.seed);
-  let bestConfig = liveConfig;
-  let bestResult = evaluateConfig(source, bestConfig, args);
-  let bestFitness = configFitness(bestResult);
-  printResult("baseline", bestResult);
+  const eliteCount = Math.min(args.elite, args.population);
+  const seen = new Map();
+  let elites = [evaluateCandidate(source, liveConfig, args)];
+  seen.set(configKey(liveConfig), elites[0]);
+  printResult("baseline", elites[0].result);
 
   for (let generation = 1; generation <= args.generations; generation += 1) {
-    const candidates = [{ config: bestConfig, result: bestResult, fitness: bestFitness }];
-    const scale = Math.max(0.35, 1 - generation / (args.generations + 3));
+    const generationCandidates = [...elites];
 
-    while (candidates.length < args.population) {
-      const candidateConfig = mutateConfig(bestConfig, rng, scale);
-      const result = evaluateConfig(source, candidateConfig, args);
-      candidates.push({
-        config: candidateConfig,
-        result,
-        fitness: configFitness(result),
+    while (generationCandidates.length < args.population) {
+      const candidateConfig = buildEvolutionCandidate(
+        elites,
+        liveConfig,
+        rng,
+        generation,
+        args.generations,
+      );
+      const key = configKey(candidateConfig);
+      if (seen.has(key)) {
+        generationCandidates.push(seen.get(key));
+        continue;
+      }
+
+      const candidate = evaluateCandidate(source, candidateConfig, args);
+      seen.set(key, candidate);
+      generationCandidates.push(candidate);
+    }
+
+    generationCandidates.sort((a, b) => b.fitness - a.fitness);
+    elites = generationCandidates.slice(0, eliteCount);
+    printEvolutionGeneration(generation, elites[0], elites);
+
+    if (args.versusGames > 0 && generation % 3 === 0) {
+      const versusResult = evaluateVersusRefs(source, elites[0].config, {
+        ...args,
+        games: args.versusGames,
       });
+      printVersusResult(`generation ${String(generation).padStart(2, "0")} previous-AI check`, versusResult);
     }
+  }
 
-    candidates.sort((a, b) => b.fitness - a.fitness);
-    const leader = candidates[0];
-    if (leader.fitness > bestFitness) {
-      bestConfig = leader.config;
-      bestResult = leader.result;
-      bestFitness = leader.fitness;
-    }
-    printResult(`generation ${String(generation).padStart(2, "0")}`, bestResult);
+  const bestConfig = elites[0].config;
+  const bestResult = elites[0].result;
+
+  if (args.versusGames > 0) {
+    const versusResult = evaluateVersusRefs(source, bestConfig, {
+      ...args,
+      games: Math.max(args.versusGames, args.refs.length || 5),
+    });
+    printVersusResult("final previous-AI check", versusResult);
   }
 
   console.log("Best constants:");

@@ -98,7 +98,6 @@ button {
 
 #game-shell[data-menu="multi"] .home-card {
   width: min(600px, calc(100% - 24px));
-  padding: 32px;
 }
 
 .home-screen.home-entering .home-card {
@@ -240,7 +239,6 @@ h2 {
 }
 
 #game-shell[data-menu="multi"] .home-brand {
-  justify-content: center;
   margin-bottom: 28px;
 }
 
@@ -248,37 +246,8 @@ h2 {
   text-align: center;
 }
 
-#game-shell[data-menu="multi"] .home-mark {
-  width: 44px;
-  height: 44px;
-  border-width: 2px;
-}
-
-#game-shell[data-menu="multi"] .home-mark::before {
-  width: 8px;
-  height: 8px;
-  top: 11px;
-  right: 11px;
-}
-
-#game-shell[data-menu="multi"] .home-mark::after {
-  width: 10px;
-  height: 10px;
-  left: 10px;
-  bottom: 10px;
-}
-
-#game-shell[data-menu="multi"] h2 {
-  font-size: 56px;
-}
-
-#game-shell[data-menu="multi"] .multiplayer-panel {
-  gap: 12px;
-}
-
 #game-shell[data-menu="multi"] .room-field {
   order: 1;
-  gap: 8px;
 }
 
 #game-shell[data-menu="multi"] #join-room {
@@ -286,9 +255,6 @@ h2 {
   border-color: var(--primary);
   background: var(--primary);
   color: #ffffff;
-  min-height: 44px;
-  font-size: 17px;
-  font-weight: 400;
 }
 
 #game-shell[data-menu="multi"] #join-room:hover,
@@ -300,14 +266,6 @@ h2 {
 
 #game-shell[data-menu="multi"] .room-actions {
   order: 3;
-  gap: 12px;
-}
-
-#game-shell[data-menu="multi"] .room-actions .primary-action,
-#game-shell[data-menu="multi"] .room-actions .secondary-action {
-  min-height: 44px;
-  font-size: 17px;
-  font-weight: 400;
 }
 
 .room-field {
@@ -341,11 +299,7 @@ h2 {
 }
 
 #game-shell[data-menu="multi"] .room-field input {
-  height: 44px;
-  padding: 12px 20px;
   border-color: var(--hairline);
-  font-size: 17px;
-  font-weight: 400;
 }
 
 .room-field input:focus {
@@ -660,7 +614,7 @@ p[hidden] {
   }
 
   .home-brand {
-    align-items: flex-start;
+    align-items: center;
     gap: 12px;
     margin-bottom: 24px;
   }
@@ -669,50 +623,14 @@ p[hidden] {
     font-size: 40px;
   }
 
-  .home-brand,
-  #game-shell[data-menu="multi"] .home-brand {
-    align-items: center;
-    gap: 12px;
-  }
-
-  #game-shell[data-menu="multi"] .home-mark {
-    width: 44px;
-    height: 44px;
-    border-width: 2px;
-  }
-
-  #game-shell[data-menu="multi"] .home-mark::before {
-    width: 8px;
-    height: 8px;
-    top: 11px;
-    right: 11px;
-  }
-
-  #game-shell[data-menu="multi"] .home-mark::after {
-    width: 10px;
-    height: 10px;
-    left: 10px;
-    bottom: 10px;
-  }
-
-  #game-shell[data-menu="multi"] h2 {
-    font-size: 40px;
-  }
-
   #game-shell[data-menu="multi"] .multiplayer-panel {
     gap: 20px;
-  }
-
-  #game-shell[data-menu="multi"] .room-actions {
-    gap: 12px;
   }
 
   #game-shell[data-menu="multi"] #join-room,
   #game-shell[data-menu="multi"] .room-actions .primary-action,
   #game-shell[data-menu="multi"] .room-actions .secondary-action {
     min-height: 48px;
-    font-size: 17px;
-    font-weight: 400;
   }
 
   #game-shell[data-menu="multi"] .room-field input {

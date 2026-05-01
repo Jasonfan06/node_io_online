@@ -75,7 +75,7 @@ export function createRoomSocketServer(server, { protocol }) {
       createdAt: Date.now(),
     };
     rooms.set(room.id, room);
-    clients.set(ws, { roomId: room.id, role: "host", clientId: message.clientId || null });
+    clients.set(ws, { roomId: room.id, role: "host" });
 
     send(ws, { type: "roomCreated", roomId: room.id });
   }
@@ -97,7 +97,7 @@ export function createRoomSocketServer(server, { protocol }) {
     detachFromRoom(ws, false);
 
     room.guest = ws;
-    clients.set(ws, { roomId: room.id, role: "guest", clientId: message.clientId || null });
+    clients.set(ws, { roomId: room.id, role: "guest" });
 
     send(ws, { type: "joinedRoom", roomId: room.id });
     send(room.host, { type: "guestJoined", roomId: room.id });
@@ -159,7 +159,7 @@ export function createRoomSocketServer(server, { protocol }) {
   }
 
   wss.on("connection", (ws) => {
-    clients.set(ws, { roomId: null, role: null, clientId: null });
+    clients.set(ws, { roomId: null, role: null });
 
     ws.on("message", (raw) => handleMessage(ws, raw));
     ws.on("close", () => detachFromRoom(ws, true));

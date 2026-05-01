@@ -43,32 +43,39 @@
   const ROOM_MIN = 100000;
   const ROOM_MAX = 999999;
   const AI_DECISION_INTERVAL = 0.28;
-  const AI_HORIZON = 22;
+  const AI_HORIZON = 26;
   const AI_AVERAGE_SPEED = ((112 + 146) / 2) * (2 / 3);
-  const AI_MIN_NODE_RESERVE = 0;
+  const AI_MIN_NODE_RESERVE = 1;
   const AI_SAFETY_MARGIN = 2;
   const AI_MAX_CANDIDATES = 22;
   const AI_RESPONSE_DELAY = 0.35;
   const AI_EXPANSION_BONUS = 16;
-  const AI_MAX_ORDERS = 3;
+  const AI_MAX_ORDERS = 2;
   const AI_MAX_DEFENSE_ORDERS = 2;
+  const AI_EXPANSION_GARRISON_BASE = 2;
+  const AI_EXPANSION_GARRISON_FRONT = 9;
+  const AI_EXPANSION_GARRISON_MAX = 7;
+  const AI_STABILIZE_SCORE_BIAS = 32;
+  const AI_STABILIZE_BACK_STRENGTH = 4;
+  const AI_STABILIZE_FRONT_STRENGTH = 2;
+  const AI_STABILIZE_MAX_CANDIDATES = 2;
   const AI_INVEST_ENABLED = 1;
-  const AI_INVEST_MIN_SURPLUS = 9;
-  const AI_INVEST_MAX_UNITS = 3;
-  const AI_INVEST_FRONT_HP_TARGET = 9;
-  const AI_INVEST_BACK_HP_TARGET = 5;
-  const AI_INVEST_SCORE_BIAS = 14;
+  const AI_INVEST_MIN_SURPLUS = 4;
+  const AI_INVEST_MAX_UNITS = 4;
+  const AI_INVEST_FRONT_HP_TARGET = 4;
+  const AI_INVEST_BACK_HP_TARGET = 1;
+  const AI_INVEST_SCORE_BIAS = -4;
   const AI_EXPANSION_VALUE_WEIGHT = 1.05;
   const AI_EXPANSION_COST_WEIGHT = 1.9;
   const AI_EXPANSION_CONTEST_SCALE = 0.06;
-  const AI_ATTACK_VALUE_WEIGHT = 3.6;
-  const AI_ATTACK_COST_WEIGHT = 0.45;
+  const AI_ATTACK_VALUE_WEIGHT = 4;
+  const AI_ATTACK_COST_WEIGHT = 0.15;
   const AI_ATTACK_ADVANTAGE_GATE = 0;
   const AI_ATTACK_ADVANTAGE_WEIGHT = 3.4;
-  const AI_ATTACK_NEED_PADDING = 1;
+  const AI_ATTACK_NEED_PADDING = 0;
   const AI_PRESSURE_ATTACK_GATE = 0;
   const AI_ORDER_THRESHOLD = 0;
-  const AI_FINISH_BIAS = 65;
+  const AI_FINISH_BIAS = 95;
   const AI_FINISH_OVERKILL = 2;
   const AI_DECISIVE_NODE_LEAD = 2;
   const AI_DECISIVE_UNIT_LEAD = 24;
@@ -1393,6 +1400,33 @@
     }, 0);
   }
 
+  function closestOwnerEta(snapshot, node, owner, fallback = AI_HORIZON) {
+    return snapshot.nodes
+      .filter((candidate) => candidate.owner === owner && candidate.id !== node.id)
+      .reduce((best, candidate) => Math.min(best, travelTimeBetween(candidate, node)), fallback);
+  }
+
+  function isFrontlineNode(snapshot, node, owner = OWNER.AI) {
+    const enemyEta = closestOwnerEta(snapshot, node, otherOwner(owner));
+    const friendlyEta = closestOwnerEta(snapshot, node, owner);
+    return enemyEta <= AI_HORIZON * 0.7 || enemyEta <= friendlyEta + 3;
+  }
+
+  function expansionGarrisonNeed(snapshot, node) {
+    const frontline = isFrontlineNode(snapshot, node, OWNER.AI);
+    const threatPadding = Math.ceil(
+      potentialThreatTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.75) *
+        AI_EXPANSION_CONTEST_SCALE,
+    );
+    const captureCostDiscount = Math.floor(node.captureRemaining / 30);
+    const desired =
+      (frontline ? AI_EXPANSION_GARRISON_FRONT : AI_EXPANSION_GARRISON_BASE) +
+      threatPadding -
+      captureCostDiscount;
+
+    return clamp(desired, 1, AI_EXPANSION_GARRISON_MAX);
+  }
+
   function reserveForNode(snapshot, node, owner = OWNER.AI) {
     const stationed = stationedOn(node, owner);
     if (stationed <= 0 || node.owner !== owner) {
@@ -1414,7 +1448,11 @@
     );
 
     const uncoveredThreat = Math.max(0, knownThreat - knownSupport - node.hp);
-    const baseReserve = Math.min(AI_MIN_NODE_RESERVE, stationed);
+    const frontlineReserve =
+      owner === OWNER.AI && isFrontlineNode(snapshot, node, owner) && node.hp <= 1
+        ? 1
+        : 0;
+    const baseReserve = Math.min(AI_MIN_NODE_RESERVE + frontlineReserve, stationed);
     const reserve = Math.ceil(baseReserve + uncoveredThreat);
 
     return Math.min(stationed, reserve);
@@ -1882,6 +1920,37 @@
       .filter(Boolean);
   }
 
+  function generateStabilizeCandidates(snapshot) {
+    return snapshot.nodes
+      .filter((node) => node.owner === OWNER.AI)
+      .map((node) => {
+        const frontline = isFrontlineNode(snapshot, node, OWNER.AI);
+        const desiredStrength =
+          (frontline ? AI_STABILIZE_FRONT_STRENGTH : AI_STABILIZE_BACK_STRENGTH) +
+          Math.ceil(potentialThreatTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.65) * 0.08);
+        const currentStrength =
+          stationedOn(node, OWNER.AI) +
+          node.hp +
+          knownInboundTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.55);
+        const need = Math.max(0, desiredStrength - currentStrength);
+        if (need <= 0) {
+          return null;
+        }
+
+        return buildNodeTransferOrder(snapshot, OWNER.AI, "stabilize", node, need, {
+          allowPartial: true,
+          scoreBias:
+            AI_STABILIZE_SCORE_BIAS +
+            need * 7 +
+            (frontline ? 12 : 0) +
+            Math.max(0, 3 - node.hp) * 4,
+        });
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.scoreBias - a.scoreBias)
+      .slice(0, AI_STABILIZE_MAX_CANDIDATES);
+  }
+
   function generateExpansionCandidates(snapshot) {
     return snapshot.nodes
       .filter((node) => node.owner === OWNER.NEUTRAL)
@@ -1889,7 +1958,8 @@
         const contestRisk =
           potentialThreatTo(snapshot, node, OWNER.AI, AI_HORIZON) *
           AI_EXPANSION_CONTEST_SCALE;
-        const required = node.captureRemaining + 1 + Math.ceil(contestRisk);
+        const garrison = expansionGarrisonNeed(snapshot, node);
+        const required = node.captureRemaining + 1 + garrison + Math.ceil(contestRisk);
         const order = buildNodeTransferOrder(snapshot, OWNER.AI, "capture", node, required, {
           scoreBias:
             AI_EXPANSION_BONUS +
@@ -2096,6 +2166,7 @@
 
   function generateProactiveCandidates(snapshot) {
     return [
+      ...generateStabilizeCandidates(snapshot),
       ...generateExpansionCandidates(snapshot),
       ...generateAttackCandidates(snapshot),
       ...generateSupplyCandidates(snapshot),
