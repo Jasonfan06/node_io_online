@@ -18,7 +18,7 @@ const DEFAULT_MATCH = {
 };
 
 const TRAINABLE_CONSTANTS = {
-  AI_DECISION_INTERVAL: { min: 0.1, max: 0.32, step: 0.02 },
+  AI_DECISION_INTERVAL: { min: 0.01, max: 0.32, step: 0.01 },
   AI_HORIZON: { min: 18, max: 30, step: 2 },
   AI_MIN_NODE_RESERVE: { min: 0, max: 4, step: 1 },
   AI_SAFETY_MARGIN: { min: 1, max: 6, step: 1 },
@@ -37,6 +37,10 @@ const TRAINABLE_CONSTANTS = {
   AI_ATTACK_COST_WEIGHT: { min: 0.15, max: 0.8, step: 0.05 },
   AI_ATTACK_ADVANTAGE_WEIGHT: { min: 2, max: 5.6, step: 0.2 },
   AI_ATTACK_NEED_PADDING: { min: 0, max: 4, step: 1 },
+  AI_PLAN_ENABLED: { min: 0, max: 1, step: 1 },
+  AI_PLAN_TOP_CANDIDATES: { min: 3, max: 8, step: 1 },
+  AI_PLAN_FOLLOWUP_CANDIDATES: { min: 2, max: 8, step: 1 },
+  AI_PLAN_FOLLOWUP_WEIGHT: { min: 0, max: 0.55, step: 0.05 },
   AI_FINISH_BIAS: { min: 40, max: 130, step: 5 },
   AI_FINISH_OVERKILL: { min: 1, max: 6, step: 1 },
   AI_DECISIVE_UNIT_LEAD: { min: 10, max: 34, step: 2 },
@@ -50,7 +54,19 @@ const TRAINABLE_CONSTANTS = {
   AI_INVEST_SCORE_BIAS: { min: -20, max: 50, step: 2 },
 };
 
-const OPPONENTS = ["passive", "weak", "greedy", "raider", "turtle"];
+const OPPONENTS = [
+  "passive",
+  "weak",
+  "greedy",
+  "raider",
+  "turtle",
+  "neutral-rush",
+  "all-in",
+  "delayed-counter",
+  "raid-feint",
+  "mirror-smart",
+];
+const SCRIPTED_TARGET_WIN_RATE = 0.95;
 
 function parseArgs(argv) {
   const args = {
@@ -60,11 +76,25 @@ function parseArgs(argv) {
     population: 18,
     elite: 4,
     versusGames: 15,
+    versusCandidates: 4,
+    versusPrimary: false,
     versusFitness: true,
-    opponents: ["weak", "greedy", "raider", "turtle"],
+    opponents: [
+      "weak",
+      "greedy",
+      "raider",
+      "turtle",
+      "neutral-rush",
+      "all-in",
+      "delayed-counter",
+      "raid-feint",
+    ],
     refs: [],
     apply: false,
     seed: "node-field-ai-lab",
+    validationGames: 40,
+    holdoutSeed: "",
+    traceLosses: true,
     verbose: false,
   };
 
@@ -83,6 +113,11 @@ function parseArgs(argv) {
       args.elite = Math.max(1, Number(value) || args.elite);
     } else if (key === "versus-games") {
       args.versusGames = Math.max(0, Number(value) || args.versusGames);
+    } else if (key === "versus-candidates") {
+      args.versusCandidates = Math.max(1, Number(value) || args.versusCandidates);
+    } else if (key === "versus-primary") {
+      args.versusPrimary = value !== "false";
+      args.versusFitness = true;
     } else if (key === "versus-fitness") {
       args.versusFitness = value !== "false";
     } else if (key === "opponents") {
@@ -93,11 +128,21 @@ function parseArgs(argv) {
       args.apply = value !== "false";
     } else if (key === "seed") {
       args.seed = value;
+    } else if (key === "validation-games") {
+      const parsed = Number(value);
+      args.validationGames = Number.isFinite(parsed) ? Math.max(0, parsed) : args.validationGames;
+    } else if (key === "holdout-seed") {
+      args.holdoutSeed = value;
+    } else if (key === "trace-losses") {
+      args.traceLosses = value !== "false";
     } else if (key === "verbose") {
       args.verbose = value !== "false";
     }
   }
 
+  if (!args.holdoutSeed) {
+    args.holdoutSeed = `${args.seed}-holdout`;
+  }
   args.opponents = args.opponents.filter((opponent) => OPPONENTS.includes(opponent));
   if (args.opponents.length === 0) {
     args.opponents = ["weak"];
@@ -431,6 +476,7 @@ function mirrorStateForAdvisor(gameApi, advisorApi) {
 function executeAdvisorOrdersAsOwner(gameApi, orders, owner) {
   let issued = 0;
   for (const order of orders || []) {
+    let orderIssued = 0;
     for (const leg of order.legs || []) {
       const source = gameApi.state.nodes.find((node) => node.id === leg.sourceId);
       if (!source || source.owner !== owner) {
@@ -444,7 +490,7 @@ function executeAdvisorOrdersAsOwner(gameApi, orders, owner) {
       }
 
       if (leg.kind === "point") {
-        issued += gameApi.executeUnitOrderToPoint(
+        orderIssued += gameApi.executeUnitOrderToPoint(
           owner,
           unitIds,
           leg.x,
@@ -455,8 +501,12 @@ function executeAdvisorOrdersAsOwner(gameApi, orders, owner) {
 
       const target = gameApi.state.nodes.find((node) => node.id === leg.targetId);
       if (target) {
-        issued += gameApi.executeUnitOrderToNode(owner, unitIds, target);
+        orderIssued += gameApi.executeUnitOrderToNode(owner, unitIds, target);
       }
+    }
+    if (orderIssued > 0) {
+      issued += orderIssued;
+      gameApi.state.ai.lastOrder = `${owner}:${order.type}`;
     }
   }
   return issued;
@@ -510,6 +560,10 @@ function neutralNodes(api) {
   return api.state.nodes.filter((node) => node.owner === api.OWNER.NEUTRAL);
 }
 
+function ownedNodes(api, owner) {
+  return api.state.nodes.filter((node) => node.owner === owner);
+}
+
 function stationedIds(api, node, owner) {
   return api.stationedUnitsAt(node.id, owner).map((unit) => unit.id);
 }
@@ -528,29 +582,60 @@ function incomingTo(api, target, owner) {
   }, 0);
 }
 
-function sendFromNode(api, source, target, count) {
-  const unitIds = stationedIds(api, source, api.OWNER.PLAYER).slice(0, Math.max(0, Math.floor(count)));
+function mobileAvailable(api, node, owner, reserve = 2) {
+  return Math.max(0, api.stationedUnitsAt(node.id, owner).length - reserve);
+}
+
+function sendFromNode(api, source, target, count, owner = api.OWNER.PLAYER) {
+  const unitIds = stationedIds(api, source, owner).slice(0, Math.max(0, Math.floor(count)));
   if (unitIds.length > 0) {
-    api.executeUnitOrderToNode(api.OWNER.PLAYER, unitIds, target);
+    api.executeUnitOrderToNode(owner, unitIds, target);
   }
   return unitIds.length;
 }
 
-function nearestOwnedNode(api, target, owner) {
+function sendPointFromNode(api, source, x, y, count, owner = api.OWNER.PLAYER) {
+  const unitIds = stationedIds(api, source, owner).slice(0, Math.max(0, Math.floor(count)));
+  if (unitIds.length > 0) {
+    api.executeUnitOrderToPoint(owner, unitIds, x, y);
+  }
+  return unitIds.length;
+}
+
+function nearestOwnedNode(api, target, owner, includeTarget = false) {
   const sources = api.state.nodes
-    .filter((node) => node.owner === owner && node.id !== target.id)
+    .filter((node) => node.owner === owner && (includeTarget || node.id !== target.id))
     .sort((a, b) => distance(a, target) - distance(b, target));
   return sources[0] || null;
 }
 
-function strongestPlayerSources(api) {
-  return playerNodes(api)
+function strongestSources(api, owner, reserve = 2) {
+  return ownedNodes(api, owner)
     .map((node) => ({
       node,
-      available: Math.max(0, api.stationedUnitsAt(node.id, api.OWNER.PLAYER).length - 2),
+      available: mobileAvailable(api, node, owner, reserve),
     }))
     .filter((entry) => entry.available > 0)
     .sort((a, b) => b.available - a.available);
+}
+
+function strongestPlayerSources(api) {
+  return strongestSources(api, api.OWNER.PLAYER, 2);
+}
+
+function weakestOwnedTarget(api, owner) {
+  return ownedNodes(api, owner)
+    .map((node) => ({
+      node,
+      strength: nodeStrength(api, node, owner),
+      inboundFriendly: incomingTo(api, node, owner),
+      inboundEnemy: incomingTo(api, node, owner === api.OWNER.AI ? api.OWNER.PLAYER : api.OWNER.AI),
+    }))
+    .sort((a, b) => {
+      const scoreA = a.strength + a.inboundFriendly * 0.4 - a.inboundEnemy * 0.6;
+      const scoreB = b.strength + b.inboundFriendly * 0.4 - b.inboundEnemy * 0.6;
+      return scoreA - scoreB;
+    })[0]?.node || null;
 }
 
 function chooseWeakTarget(api, source, mode) {
@@ -588,8 +673,112 @@ function chooseWeakTarget(api, source, mode) {
   return neutrals.find((entry) => entry.cost <= 18) || enemies[0] || neutrals[0] || null;
 }
 
-function runWeakOpponentTurn(api, mode) {
+function runNeutralRushTurn(api) {
+  const sources = strongestSources(api, api.OWNER.PLAYER, 1);
+  const targets = neutralNodes(api)
+    .map((node) => ({
+      node,
+      cost: node.captureRemaining + 2,
+      score: node.captureRemaining * 1.6 + distance(node, nearestOwnedNode(api, node, api.OWNER.PLAYER, true)) * 0.035,
+    }))
+    .sort((a, b) => a.score - b.score);
+  let issued = 0;
+  for (const { node: source, available } of sources) {
+    if (issued >= 3 || targets.length === 0) {
+      break;
+    }
+    const target = targets.shift();
+    const count = Math.min(available, target.cost + 1);
+    if (sendFromNode(api, source, target.node, count) > 0) {
+      issued += 1;
+    }
+  }
+}
+
+function runAllInTurn(api) {
+  const target = weakestOwnedTarget(api, api.OWNER.AI);
+  if (!target) {
+    return;
+  }
+  const required = nodeStrength(api, target, api.OWNER.AI) + incomingTo(api, target, api.OWNER.AI) + 4;
+  let remaining = required;
+  for (const { node: source, available } of strongestSources(api, api.OWNER.PLAYER, 0)) {
+    if (remaining <= 0) {
+      break;
+    }
+    const sent = sendFromNode(api, source, target, Math.min(available, remaining));
+    remaining -= sent;
+  }
+}
+
+function runRaidFeintTurn(api, memory) {
+  const target = weakestOwnedTarget(api, api.OWNER.AI);
+  const source = strongestSources(api, api.OWNER.PLAYER, 2)[0];
+  if (!target || !source) {
+    return;
+  }
+
+  memory.raidFeintFlip = !memory.raidFeintFlip;
+  if (memory.raidFeintFlip && source.available >= 4) {
+    const x = source.node.x * 0.45 + target.x * 0.55;
+    const y = source.node.y * 0.45 + target.y * 0.55;
+    sendPointFromNode(api, source.node, x, y, Math.min(3, source.available));
+    return;
+  }
+
+  const pressure = nodeStrength(api, target, api.OWNER.AI) + 2;
+  sendFromNode(api, source.node, target, Math.min(source.available, pressure));
+}
+
+function runDelayedCounterTurn(api, elapsed) {
+  if (elapsed < 22) {
+    runNeutralRushTurn(api);
+    return;
+  }
+
+  const overextended = aiNodes(api)
+    .map((node) => ({
+      node,
+      strength: nodeStrength(api, node, api.OWNER.AI) + incomingTo(api, node, api.OWNER.AI) * 0.4,
+      nearestPlayer: nearestOwnedNode(api, node, api.OWNER.PLAYER),
+    }))
+    .filter((entry) => entry.nearestPlayer)
+    .sort((a, b) => a.strength + distance(a.node, a.nearestPlayer) * 0.02 -
+      (b.strength + distance(b.node, b.nearestPlayer) * 0.02))[0];
+  if (!overextended) {
+    runAllInTurn(api);
+    return;
+  }
+
+  const required = nodeStrength(api, overextended.node, api.OWNER.AI) + 3;
+  const source = strongestSources(api, api.OWNER.PLAYER, 1)[0];
+  if (source) {
+    sendFromNode(api, source.node, overextended.node, Math.min(source.available, required));
+  }
+}
+
+function runWeakOpponentTurn(api, mode, elapsed = 0, memory = {}) {
   if (mode === "passive") {
+    return;
+  }
+
+  if (mode === "neutral-rush") {
+    runNeutralRushTurn(api);
+    return;
+  }
+
+  if (mode === "all-in") {
+    runAllInTurn(api);
+    return;
+  }
+
+  if (mode === "delayed-counter") {
+    runDelayedCounterTurn(api, elapsed);
+    return;
+  }
+
+  if (mode === "raid-feint") {
+    runRaidFeintTurn(api, memory);
     return;
   }
 
@@ -631,8 +820,37 @@ function runWeakOpponentTurn(api, mode) {
   }
 }
 
+function boardTrace(api, elapsed) {
+  return {
+    t: Number(elapsed.toFixed(1)),
+    playerNodes: api.controlledNodeCount(api.OWNER.PLAYER),
+    aiNodes: api.controlledNodeCount(api.OWNER.AI),
+    playerUnits: api.unitCount(api.OWNER.PLAYER),
+    aiUnits: api.unitCount(api.OWNER.AI),
+    aiOrder: api.state.ai.lastOrder,
+  };
+}
+
+function formatTrace(match) {
+  const final = match.final || {};
+  const timeline = (match.trace || [])
+    .slice(-8)
+    .map((point) => {
+      return `${point.t}s n=${point.playerNodes}-${point.aiNodes} u=${point.playerUnits}-${point.aiUnits} ai=${point.aiOrder}`;
+    })
+    .join(" | ");
+  return (
+    `loss-trace seed=${match.seed || "unknown"} opponent=${match.opponent || match.ref || "unknown"} ` +
+    `side=${match.currentSide || "ai"} winner=${match.winner || "draw"} ` +
+    `final n=${final.playerNodes}-${final.aiNodes} u=${final.playerUnits}-${final.aiUnits} ` +
+    `score=${match.score.toFixed(2)} time=${match.elapsed.toFixed(1)}s :: ${timeline}`
+  );
+}
+
 function runMatch(source, config, seed, opponent, options = {}) {
   const { api, context } = createGame(source, config, seed);
+  const mirrorAdvisor =
+    opponent === "mirror-smart" ? createGame(source, config, `${seed}-mirror-smart`) : null;
   const settings = { ...DEFAULT_MATCH, ...options };
   api.state.match.mode = "single";
   api.state.match.localOwner = api.OWNER.PLAYER;
@@ -646,18 +864,38 @@ function runMatch(source, config, seed, opponent, options = {}) {
     greedy: 0.62,
     raider: 0.7,
     turtle: 0.78,
+    "neutral-rush": 0.32,
+    "all-in": 0.42,
+    "delayed-counter": 0.58,
+    "raid-feint": 0.46,
+    "mirror-smart": 0.48,
   }[opponent] || 0.9;
   let opponentElapsed = opponentInterval;
   let elapsed = 0;
+  let nextTraceAt = 0;
+  const memory = {};
+  const trace = [];
 
   while (elapsed < settings.maxSeconds && api.state.phase === "playing") {
     opponentElapsed += settings.dt;
     if (opponentElapsed >= opponentInterval) {
       opponentElapsed = 0;
-      runWeakOpponentTurn(api, opponent);
+      if (mirrorAdvisor) {
+        issueAdvisorOrders(api, mirrorAdvisor.api, api.OWNER.PLAYER, true);
+      } else {
+        runWeakOpponentTurn(api, opponent, elapsed, memory);
+      }
+    }
+
+    if (settings.trace && elapsed >= nextTraceAt) {
+      trace.push(boardTrace(api, elapsed));
+      nextTraceAt += 5;
     }
 
     context.__now += settings.dt * 1000;
+    if (mirrorAdvisor) {
+      mirrorAdvisor.context.__now += settings.dt * 1000;
+    }
     api.update(settings.dt);
     elapsed += settings.dt;
   }
@@ -669,58 +907,126 @@ function runMatch(source, config, seed, opponent, options = {}) {
     (api.unitCount(api.OWNER.AI) - api.unitCount(api.OWNER.PLAYER)) * 0.03;
 
   return {
+    seed,
+    opponent,
     winner,
     aiWon: winner === api.OWNER.AI,
     playerWon: winner === api.OWNER.PLAYER,
     score,
     elapsed,
+    trace,
+    final: boardTrace(api, elapsed),
   };
 }
 
-function runVersusMatch(currentSource, currentConfig, previousSource, seed, options = {}) {
+function issueAdvisorOrders(gameApi, advisorApi, owner, mirrored) {
+  if (mirrored) {
+    mirrorStateForAdvisor(gameApi, advisorApi);
+  } else {
+    syncStateForAdvisor(gameApi, advisorApi);
+  }
+  const orders = advisorApi.chooseAiOrders(advisorApi.snapshotState());
+  return executeAdvisorOrdersAsOwner(gameApi, orders, owner);
+}
+
+function runVersusMatch(
+  currentSource,
+  currentConfig,
+  previousSource,
+  seed,
+  currentSide = "ai",
+  options = {},
+) {
   const game = createGame(currentSource, currentConfig, seed);
-  const previous = createGame(previousSource, {}, `${seed}-previous`);
+  const currentAdvisor = createGame(currentSource, currentConfig, `${seed}-current`);
+  const previousAdvisor = createGame(previousSource, {}, `${seed}-previous`);
   const settings = { ...DEFAULT_MATCH, ...options };
-  const opponentInterval = optionalConstantValue(
+  const currentInterval = optionalConstantValue(
+    currentSource,
+    "AI_DECISION_INTERVAL",
+    0.28,
+  );
+  const previousInterval = optionalConstantValue(
     previousSource,
     "AI_DECISION_INTERVAL",
     0.28,
   );
-  let opponentElapsed = opponentInterval;
+  let currentElapsed = currentInterval;
+  let previousElapsed = previousInterval;
   let elapsed = 0;
+  let nextTraceAt = 0;
+  const trace = [];
 
   game.api.state.match.mode = "single";
   game.api.state.match.localOwner = game.api.OWNER.PLAYER;
   game.api.state.match.isHost = true;
   game.api.state.match.connected = false;
   game.api.newGame({ seed, phase: "playing" });
+  game.api.state.match.mode = "lab";
 
   while (elapsed < settings.maxSeconds && game.api.state.phase === "playing") {
-    opponentElapsed += settings.dt;
-    if (opponentElapsed >= opponentInterval) {
-      opponentElapsed = 0;
-      mirrorStateForAdvisor(game.api, previous.api);
-      const orders = previous.api.chooseAiOrders(previous.api.snapshotState());
-      executeAdvisorOrdersAsPlayer(game.api, orders);
+    currentElapsed += settings.dt;
+    previousElapsed += settings.dt;
+
+    let currentBatches = 0;
+    while (currentElapsed >= currentInterval && currentBatches < 8) {
+      currentElapsed -= currentInterval;
+      currentBatches += 1;
+      issueAdvisorOrders(
+        game.api,
+        currentAdvisor.api,
+        currentSide === "ai" ? game.api.OWNER.AI : game.api.OWNER.PLAYER,
+        currentSide === "player",
+      );
+    }
+
+    let previousBatches = 0;
+    while (previousElapsed >= previousInterval && previousBatches < 8) {
+      previousElapsed -= previousInterval;
+      previousBatches += 1;
+      issueAdvisorOrders(
+        game.api,
+        previousAdvisor.api,
+        currentSide === "ai" ? game.api.OWNER.PLAYER : game.api.OWNER.AI,
+        currentSide === "ai",
+      );
+    }
+
+    if (settings.trace && elapsed >= nextTraceAt) {
+      trace.push(boardTrace(game.api, elapsed));
+      nextTraceAt += 5;
     }
 
     game.context.__now += settings.dt * 1000;
-    previous.context.__now += settings.dt * 1000;
+    currentAdvisor.context.__now += settings.dt * 1000;
+    previousAdvisor.context.__now += settings.dt * 1000;
     game.api.update(settings.dt);
     elapsed += settings.dt;
   }
 
+  const boardScore =
+    game.api.controlledNodeCount(game.api.OWNER.AI) -
+      game.api.controlledNodeCount(game.api.OWNER.PLAYER) +
+    (game.api.unitCount(game.api.OWNER.AI) -
+      game.api.unitCount(game.api.OWNER.PLAYER)) *
+      0.03;
+  const currentWon =
+    (currentSide === "ai" && game.api.state.winner === game.api.OWNER.AI) ||
+    (currentSide === "player" && game.api.state.winner === game.api.OWNER.PLAYER);
+  const previousWon =
+    (currentSide === "ai" && game.api.state.winner === game.api.OWNER.PLAYER) ||
+    (currentSide === "player" && game.api.state.winner === game.api.OWNER.AI);
+
   return {
+    seed,
     winner: game.api.state.winner,
-    aiWon: game.api.state.winner === game.api.OWNER.AI,
-    playerWon: game.api.state.winner === game.api.OWNER.PLAYER,
-    score:
-      game.api.controlledNodeCount(game.api.OWNER.AI) -
-        game.api.controlledNodeCount(game.api.OWNER.PLAYER) +
-      (game.api.unitCount(game.api.OWNER.AI) -
-        game.api.unitCount(game.api.OWNER.PLAYER)) *
-        0.03,
+    aiWon: currentWon,
+    playerWon: previousWon,
+    currentSide,
+    score: currentSide === "ai" ? boardScore : -boardScore,
     elapsed,
+    trace,
+    final: boardTrace(game.api, elapsed),
   };
 }
 
@@ -738,7 +1044,22 @@ function schedule(args) {
 
 function evaluateConfig(source, config, args) {
   const items = schedule(args);
-  const matches = items.map((item) => runMatch(source, config, item.seed, item.opponent));
+  const matches = items.map((item) => {
+    const match = runMatch(source, config, item.seed, item.opponent, {
+      trace: args.traceLosses,
+    });
+    if (args.verbose) {
+      const result = match.aiWon ? "win" : match.playerWon ? "loss" : "draw";
+      console.log(
+        `  match ${item.opponent} seed=${item.seed} ${result} ` +
+          `score=${match.score.toFixed(2)} time=${match.elapsed.toFixed(1)}s`,
+      );
+    }
+    if (args.traceLosses && !match.aiWon) {
+      console.log(formatTrace(match));
+    }
+    return match;
+  });
   const wins = matches.filter((match) => match.aiWon).length;
   const losses = matches.filter((match) => match.playerWon).length;
   const draws = matches.length - wins - losses;
@@ -805,9 +1126,29 @@ function evaluateVersusRefs(source, config, args) {
     const matches = [];
     for (let i = 0; i < gamesForRef; i += 1) {
       const seed = `${args.seed}-versus-${entry.ref}-${i}`;
-      const match = runVersusMatch(source, config, entry.source, seed);
-      matches.push(match);
-      allMatches.push(match);
+      for (const currentSide of ["ai", "player"]) {
+        const match = runVersusMatch(
+          source,
+          config,
+          entry.source,
+          seed,
+          currentSide,
+          { trace: args.traceLosses },
+        );
+        match.ref = entry.label;
+        if (args.verbose) {
+          const result = match.aiWon ? "win" : match.playerWon ? "loss" : "draw";
+          console.log(
+            `  match ${entry.label} seed=${seed} side=${currentSide} ` +
+              `${result} score=${match.score.toFixed(2)} time=${match.elapsed.toFixed(1)}s`,
+          );
+        }
+        if (args.traceLosses && !match.aiWon) {
+          console.log(formatTrace(match));
+        }
+        matches.push(match);
+        allMatches.push(match);
+      }
     }
     summaries.push({
       ref: entry.ref,
@@ -846,8 +1187,10 @@ function runInvestmentSelfMatch(source, config, seed, enabledSide, options = {})
 
   while (elapsed < settings.maxSeconds && game.api.state.phase === "playing") {
     opponentElapsed += settings.dt;
-    if (opponentElapsed >= opponentInterval) {
-      opponentElapsed = 0;
+    let batches = 0;
+    while (opponentElapsed >= opponentInterval && batches < 8) {
+      opponentElapsed -= opponentInterval;
+      batches += 1;
       syncStateForAdvisor(game.api, aiAdvisor.api);
       mirrorStateForAdvisor(game.api, playerAdvisor.api);
       const aiOrders = aiAdvisor.api.chooseAiOrders(aiAdvisor.api.snapshotState());
@@ -1073,15 +1416,32 @@ function configFitness(result, versusResult = null) {
   const versusLosses = versusResult ? versusResult.losses : 0;
 
   return (
-    result.winRate * 100000 +
-    weakestOpponentRate * 65000 +
-    versusWinRate * 85000 +
-    weakestVersusRate * 45000 +
-    result.averageScore * 25 +
-    versusScore * 18 -
-    result.averageSeconds * 0.35 -
-    result.losses * 500 -
-    versusLosses * 900
+    result.winRate * 80000 +
+    weakestOpponentRate * 80000 +
+    versusWinRate * 170000 +
+    weakestVersusRate * 120000 +
+    result.averageScore * 20 +
+    versusScore * 35 -
+    result.averageSeconds * 0.25 -
+    result.losses * 1200 -
+    versusLosses * 2800
+  );
+}
+
+function versusPrimaryFitness(result, versusResult) {
+  if (!versusResult) {
+    return configFitness(result, null);
+  }
+
+  const weakestVersusRate = resultFloorRate(versusResult);
+  return (
+    versusResult.winRate * 240000 +
+    weakestVersusRate * 180000 +
+    versusResult.averageScore * 45 +
+    result.winRate * 12000 +
+    resultFloorRate(result) * 8000 -
+    versusResult.losses * 4200 -
+    result.losses * 500
   );
 }
 
@@ -1097,19 +1457,58 @@ function applyConfig(source, config) {
 
 function evaluateCandidate(source, config, args) {
   const result = evaluateConfig(source, config, args);
-  const versusResult =
-    args.versusFitness && args.versusGames > 0
-      ? evaluateVersusRefs(source, config, {
-          ...args,
-          games: args.versusGames,
-        })
-      : null;
   return {
     config,
     result,
-    versusResult,
-    fitness: configFitness(result, versusResult),
+    scriptedFitness: configFitness(result, null),
+    versusResult: null,
+    versusChecked: false,
+    fitness: configFitness(result, null),
   };
+}
+
+function ensureVersusFitness(source, candidate, args) {
+  if (!args.versusFitness || args.versusGames <= 0 || candidate.versusChecked) {
+    return candidate;
+  }
+
+  candidate.versusResult = evaluateVersusRefs(source, candidate.config, {
+    ...args,
+    games: args.versusGames,
+  });
+  candidate.versusChecked = true;
+  candidate.fitness = args.versusPrimary
+    ? versusPrimaryFitness(candidate.result, candidate.versusResult)
+    : configFitness(candidate.result, candidate.versusResult);
+  return candidate;
+}
+
+function rankGenerationCandidates(source, candidates, args) {
+  candidates.sort((a, b) => b.scriptedFitness - a.scriptedFitness);
+  if (args.versusFitness && args.versusGames > 0) {
+    const checkCount = args.versusPrimary
+      ? candidates.length
+      : Math.min(args.versusCandidates, candidates.length);
+    candidates.slice(0, checkCount).forEach((candidate) => {
+      ensureVersusFitness(source, candidate, args);
+    });
+  }
+  if (args.versusPrimary) {
+    candidates.sort((a, b) => b.fitness - a.fitness);
+    return candidates;
+  }
+  const targetMet = candidates.filter(
+    (candidate) => candidate.result.winRate >= SCRIPTED_TARGET_WIN_RATE,
+  );
+  const primary = targetMet.length > 0 ? targetMet : candidates;
+  const secondary = targetMet.length > 0
+    ? candidates.filter((candidate) => !targetMet.includes(candidate))
+    : [];
+
+  primary.sort((a, b) => b.fitness - a.fitness);
+  secondary.sort((a, b) => b.fitness - a.fitness);
+  candidates.splice(0, candidates.length, ...primary, ...secondary);
+  return candidates;
 }
 
 function buildEvolutionCandidate(elites, liveConfig, rng, generation, generations) {
@@ -1198,7 +1597,7 @@ function main() {
   }
 
   if (args.command !== "train") {
-    console.error("Usage: node scripts/ai-lab.js [eval|train|versus|invest|self|opening] [--games=N] [--opponents=weak,greedy] [--refs=HEAD,42aafc8] [--apply]");
+    console.error("Usage: node scripts/ai-lab.js [eval|train|versus|invest|self|opening] [--games=N] [--opponents=weak,greedy,neutral-rush,all-in,delayed-counter,raid-feint] [--refs=HEAD,42aafc8] [--apply]");
     process.exitCode = 2;
     return;
   }
@@ -1207,6 +1606,7 @@ function main() {
   const eliteCount = Math.min(args.elite, args.population);
   const seen = new Map();
   let elites = [evaluateCandidate(source, liveConfig, args)];
+  ensureVersusFitness(source, elites[0], args);
   seen.set(configKey(liveConfig), elites[0]);
   printResult("baseline", elites[0].result);
 
@@ -1232,7 +1632,7 @@ function main() {
       generationCandidates.push(candidate);
     }
 
-    generationCandidates.sort((a, b) => b.fitness - a.fitness);
+    rankGenerationCandidates(source, generationCandidates, args);
     elites = generationCandidates.slice(0, eliteCount);
     printEvolutionGeneration(generation, elites[0], elites);
 
@@ -1256,6 +1656,25 @@ function main() {
     printVersusResult("final previous-AI check", versusResult);
   }
 
+  let holdoutResult = null;
+  let holdoutVersusResult = null;
+  if (args.validationGames > 0) {
+    const holdoutArgs = {
+      ...args,
+      seed: args.holdoutSeed,
+      games: args.validationGames,
+    };
+    holdoutResult = evaluateConfig(source, bestConfig, holdoutArgs);
+    printResult("held-out scripted/adversary", holdoutResult);
+    if (args.versusGames > 0) {
+      holdoutVersusResult = evaluateVersusRefs(source, bestConfig, {
+        ...holdoutArgs,
+        games: Math.max(args.validationGames, args.refs.length || 5),
+      });
+      printVersusResult("held-out previous-AI", holdoutVersusResult);
+    }
+  }
+
   console.log("Best constants:");
   printConfig(bestConfig);
   if (args.apply) {
@@ -1267,6 +1686,14 @@ function main() {
 
   if (bestResult.winRate < 0.95) {
     console.log("Target not met: increase --games, --generations, or tune opponent mix.");
+    process.exitCode = 1;
+  }
+  if (holdoutResult && holdoutResult.winRate < 0.95) {
+    console.log("Target not met: held-out scripted/adversary win rate is below 95%.");
+    process.exitCode = 1;
+  }
+  if (holdoutVersusResult && holdoutVersusResult.winRate < 0.95) {
+    console.log("Target not met: held-out previous-AI win rate is below 95%.");
     process.exitCode = 1;
   }
 }

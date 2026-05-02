@@ -42,31 +42,31 @@
   const COUNTDOWN_STEPS = ["3", "2", "1", "Start!"];
   const ROOM_MIN = 100000;
   const ROOM_MAX = 999999;
-  const AI_DECISION_INTERVAL = 0.28;
-  const AI_HORIZON = 26;
+  const AI_DECISION_INTERVAL = 0.01;
+  const AI_HORIZON = 28;
   const AI_AVERAGE_SPEED = ((112 + 146) / 2) * (2 / 3);
-  const AI_MIN_NODE_RESERVE = 1;
-  const AI_SAFETY_MARGIN = 2;
+  const AI_MIN_NODE_RESERVE = 0;
+  const AI_SAFETY_MARGIN = 1;
   const AI_MAX_CANDIDATES = 22;
-  const AI_RESPONSE_DELAY = 0.35;
-  const AI_EXPANSION_BONUS = 16;
+  const AI_RESPONSE_DELAY = 0.12;
+  const AI_EXPANSION_BONUS = 30;
   const AI_MAX_ORDERS = 2;
   const AI_MAX_DEFENSE_ORDERS = 2;
-  const AI_EXPANSION_GARRISON_BASE = 2;
-  const AI_EXPANSION_GARRISON_FRONT = 9;
-  const AI_EXPANSION_GARRISON_MAX = 7;
+  const AI_EXPANSION_GARRISON_BASE = 4;
+  const AI_EXPANSION_GARRISON_FRONT = 5;
+  const AI_EXPANSION_GARRISON_MAX = 6;
   const AI_STABILIZE_SCORE_BIAS = 32;
-  const AI_STABILIZE_BACK_STRENGTH = 4;
+  const AI_STABILIZE_BACK_STRENGTH = 3;
   const AI_STABILIZE_FRONT_STRENGTH = 2;
-  const AI_STABILIZE_MAX_CANDIDATES = 2;
+  const AI_STABILIZE_MAX_CANDIDATES = 7;
   const AI_INVEST_ENABLED = 1;
   const AI_INVEST_MIN_SURPLUS = 4;
-  const AI_INVEST_MAX_UNITS = 4;
-  const AI_INVEST_FRONT_HP_TARGET = 4;
-  const AI_INVEST_BACK_HP_TARGET = 1;
-  const AI_INVEST_SCORE_BIAS = -4;
-  const AI_EXPANSION_VALUE_WEIGHT = 1.05;
-  const AI_EXPANSION_COST_WEIGHT = 1.9;
+  const AI_INVEST_MAX_UNITS = 2;
+  const AI_INVEST_FRONT_HP_TARGET = 8;
+  const AI_INVEST_BACK_HP_TARGET = 0;
+  const AI_INVEST_SCORE_BIAS = -8;
+  const AI_EXPANSION_VALUE_WEIGHT = 1.5;
+  const AI_EXPANSION_COST_WEIGHT = 2.1;
   const AI_EXPANSION_CONTEST_SCALE = 0.06;
   const AI_ATTACK_VALUE_WEIGHT = 4;
   const AI_ATTACK_COST_WEIGHT = 0.15;
@@ -75,6 +75,10 @@
   const AI_ATTACK_NEED_PADDING = 0;
   const AI_PRESSURE_ATTACK_GATE = 0;
   const AI_ORDER_THRESHOLD = 0;
+  const AI_PLAN_ENABLED = 0;
+  const AI_PLAN_TOP_CANDIDATES = 6;
+  const AI_PLAN_FOLLOWUP_CANDIDATES = 5;
+  const AI_PLAN_FOLLOWUP_WEIGHT = 0.25;
   const AI_FINISH_BIAS = 95;
   const AI_FINISH_OVERKILL = 2;
   const AI_DECISIVE_NODE_LEAD = 2;
@@ -1437,23 +1441,32 @@
       snapshot,
       node,
       otherOwner(owner),
-      AI_HORIZON * 0.75,
+      AI_HORIZON * 0.9,
     );
 
     const knownSupport = knownInboundTo(
       snapshot,
       node,
       owner,
-      AI_HORIZON * 0.75,
+      AI_HORIZON * 0.9,
     );
 
     const uncoveredThreat = Math.max(0, knownThreat - knownSupport - node.hp);
+    const pressure = strategicPressureLevel(snapshot, owner);
+    const raidablePressure =
+      owner === OWNER.AI
+        ? potentialThreatTo(snapshot, node, owner, AI_HORIZON * 0.65)
+        : 0;
+    const pressureReserve =
+      owner === OWNER.AI && pressure >= 3
+        ? Math.ceil(Math.max(0, raidablePressure - node.hp) * 0.08)
+        : 0;
     const frontlineReserve =
-      owner === OWNER.AI && isFrontlineNode(snapshot, node, owner) && node.hp <= 1
-        ? 1
+      owner === OWNER.AI && isFrontlineNode(snapshot, node, owner)
+        ? (node.hp <= 1 || pressure >= 4 ? 1 : 0)
         : 0;
     const baseReserve = Math.min(AI_MIN_NODE_RESERVE + frontlineReserve, stationed);
-    const reserve = Math.ceil(baseReserve + uncoveredThreat);
+    const reserve = Math.ceil(baseReserve + uncoveredThreat + pressureReserve);
 
     return Math.min(stationed, reserve);
   }
@@ -1497,6 +1510,47 @@
     return stationedTotal + fleetTotal + guardTotal;
   }
 
+  function snapshotProduction(snapshot, owner) {
+    return snapshot.nodes.reduce((sum, node) => {
+      if (node.owner !== owner) {
+        return sum;
+      }
+      return sum + productionRateFor(owner, node.hp);
+    }, 0);
+  }
+
+  function strategicPressureLevel(snapshot, owner = OWNER.AI) {
+    const enemy = otherOwner(owner);
+    const ownedNodes = snapshot.nodes.filter((node) => node.owner === owner).length;
+    const enemyNodes = snapshot.nodes.filter((node) => node.owner === enemy).length;
+    const neutralNodes = snapshot.nodes.filter((node) => node.owner === OWNER.NEUTRAL).length;
+    const ownedUnits = Math.max(1, snapshotTotalUnits(snapshot, owner));
+    const enemyUnits = snapshotTotalUnits(snapshot, enemy);
+    const ownedProduction = Math.max(0.01, snapshotProduction(snapshot, owner));
+    const enemyProduction = snapshotProduction(snapshot, enemy);
+
+    let pressure = 0;
+    if (enemyNodes >= ownedNodes - 1) {
+      pressure += 1;
+    }
+    if (enemyUnits >= ownedUnits * 0.82) {
+      pressure += 1;
+    }
+    if (enemyProduction >= ownedProduction * 0.85) {
+      pressure += 1;
+    }
+    if (neutralNodes <= 2 && enemyNodes > 0) {
+      pressure += 1;
+    }
+
+    return pressure;
+  }
+
+  function adaptiveSafetyMargin(snapshot, owner = OWNER.AI) {
+    const pressure = strategicPressureLevel(snapshot, owner);
+    return AI_SAFETY_MARGIN + (pressure >= 3 ? 1 : 0);
+  }
+
   function createSim(snapshot) {
     const nodes = snapshot.nodes.map((node) => ({
       id: node.id,
@@ -1525,6 +1579,68 @@
       fleets: snapshot.fleets.map((fleet) => ({ ...fleet })),
       guards: snapshot.guards.map((guard) => ({ ...guard })),
       time: 0,
+    };
+  }
+
+  function snapshotFromSim(sim) {
+    const nodes = sim.nodes.map((node) => ({
+      id: node.id,
+      owner: node.owner,
+      x: node.x,
+      y: node.y,
+      hp: node.hp,
+      captureRequired: node.captureRequired,
+      captureRemaining: node.captureRemaining,
+      production: node.production,
+      radius: node.radius,
+      stationed: ownerCounts(
+        simStationed(sim, node.id, OWNER.PLAYER),
+        simStationed(sim, node.id, OWNER.AI),
+      ),
+    }));
+    const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+
+    return {
+      width: sim.width,
+      height: sim.height,
+      nodes,
+      nodeMap,
+      fleets: sim.fleets.map((fleet) => ({ ...fleet })),
+      guards: sim.guards
+        .filter((guard) => guard.count > 0)
+        .map((guard) => ({ ...guard })),
+    };
+  }
+
+  function mirrorSnapshotOwners(snapshot) {
+    const mirror = (owner) => {
+      if (owner === OWNER.AI) {
+        return OWNER.PLAYER;
+      }
+      if (owner === OWNER.PLAYER) {
+        return OWNER.AI;
+      }
+      return owner;
+    };
+    const nodes = snapshot.nodes.map((node) => ({
+      ...node,
+      owner: mirror(node.owner),
+      stationed: ownerCounts(stationedOn(node, OWNER.AI), stationedOn(node, OWNER.PLAYER)),
+    }));
+
+    return {
+      width: snapshot.width,
+      height: snapshot.height,
+      nodes,
+      nodeMap: new Map(nodes.map((node) => [node.id, node])),
+      fleets: snapshot.fleets.map((fleet) => ({
+        ...fleet,
+        owner: mirror(fleet.owner),
+      })),
+      guards: snapshot.guards.map((guard) => ({
+        ...guard,
+        owner: mirror(guard.owner),
+      })),
     };
   }
 
@@ -1901,7 +2017,7 @@
       worstMargin = Math.min(worstMargin, stationed + hp);
     });
 
-    return Math.max(0, AI_SAFETY_MARGIN - worstMargin);
+    return Math.max(0, adaptiveSafetyMargin(snapshot, OWNER.AI) - worstMargin);
   }
 
   function generateDefenseCandidates(snapshot) {
@@ -1980,6 +2096,35 @@
       .slice(0, 7);
   }
 
+  function generateContestExpansionCandidates(snapshot) {
+    return snapshot.nodes
+      .filter((node) => node.owner === OWNER.NEUTRAL)
+      .map((node) => {
+        const playerInbound = knownInboundTo(snapshot, node, OWNER.PLAYER, AI_HORIZON * 0.85);
+        if (playerInbound < 2) {
+          return null;
+        }
+
+        const aiInbound = knownInboundTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.85);
+        const required =
+          node.captureRemaining +
+          Math.max(1, Math.ceil((playerInbound - aiInbound) * 0.75)) +
+          expansionGarrisonNeed(snapshot, node);
+        const order = buildNodeTransferOrder(snapshot, OWNER.AI, "contest-expand", node, required, {
+          allowPartial: true,
+          scoreBias:
+            42 +
+            playerInbound * 9 +
+            nodeStrategicValue(snapshot, node) * 0.8 -
+            required * 1.1,
+        });
+        return order;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.scoreBias - a.scoreBias)
+      .slice(0, 5);
+  }
+
   function attackNeed(snapshot, target) {
     const sourceEta = snapshot.nodes
       .filter((node) => node.owner === OWNER.AI && availableFromNode(snapshot, node, OWNER.AI) > 0)
@@ -1991,7 +2136,85 @@
       Math.floor(projectedProduction) +
       knownInboundTo(snapshot, target, OWNER.PLAYER, sourceEta + AI_RESPONSE_DELAY);
 
-    return projectedDefenders + AI_SAFETY_MARGIN + AI_ATTACK_NEED_PADDING;
+    return projectedDefenders + adaptiveSafetyMargin(snapshot, OWNER.AI) + AI_ATTACK_NEED_PADDING;
+  }
+
+  function outgoingFromNode(snapshot, node, owner, horizon = AI_HORIZON) {
+    return snapshot.fleets.reduce((sum, fleet) => {
+      if (fleet.owner === owner && fleet.sourceId === node.id && fleet.eta <= horizon) {
+        return sum + fleet.count;
+      }
+      return sum;
+    }, 0);
+  }
+
+  function generateCounterRaidCandidates(snapshot) {
+    return snapshot.nodes
+      .filter((node) => node.owner === OWNER.PLAYER)
+      .map((node) => {
+        const outgoing = outgoingFromNode(snapshot, node, OWNER.PLAYER, AI_HORIZON * 0.85);
+        if (outgoing < 4) {
+          return null;
+        }
+
+        const required = attackNeed(snapshot, node);
+        const exposed =
+          outgoing -
+          (stationedOn(node, OWNER.PLAYER) +
+            node.hp +
+            knownInboundTo(snapshot, node, OWNER.PLAYER, AI_HORIZON * 0.45));
+        const order = buildNodeTransferOrder(snapshot, OWNER.AI, "counter-raid", node, required, {
+          scoreBias:
+            28 +
+            outgoing * 7 +
+            Math.max(0, exposed) * 9 +
+            nodeStrategicValue(snapshot, node) * 0.7 -
+            required * 0.35,
+        });
+        return order;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.scoreBias - a.scoreBias)
+      .slice(0, 4);
+  }
+
+  function generateAllInPunishCandidates(snapshot) {
+    const totalThreat = snapshot.nodes
+      .filter((node) => node.owner === OWNER.AI)
+      .reduce(
+        (sum, node) => sum + knownInboundTo(snapshot, node, OWNER.PLAYER, AI_HORIZON * 0.8),
+        0,
+      );
+    if (totalThreat < 10) {
+      return [];
+    }
+
+    return snapshot.nodes
+      .filter((node) => node.owner === OWNER.PLAYER)
+      .map((node) => {
+        const outgoing = outgoingFromNode(snapshot, node, OWNER.PLAYER, AI_HORIZON * 0.95);
+        if (outgoing < 8) {
+          return null;
+        }
+
+        const exposedStrength = Math.max(
+          1,
+          stationedOn(node, OWNER.PLAYER) + node.hp - outgoing * 0.45,
+        );
+        const required = Math.ceil(exposedStrength + 2);
+        return buildNodeTransferOrder(snapshot, OWNER.AI, "punish-all-in", node, required, {
+          allowPartial: true,
+          scoreBias:
+            90 +
+            outgoing * 6 +
+            totalThreat * 3 +
+            nodeStrategicValue(snapshot, node) * 0.4 -
+            required * 0.2,
+        });
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.scoreBias - a.scoreBias)
+      .slice(0, 2);
   }
 
   function generateAttackCandidates(snapshot) {
@@ -2027,6 +2250,40 @@
       .filter(Boolean)
       .sort((a, b) => b.scoreBias - a.scoreBias)
       .slice(0, 6);
+  }
+
+  function generateForcedFinishCandidates(snapshot) {
+    const playerNodes = snapshot.nodes.filter((node) => node.owner === OWNER.PLAYER);
+    if (!playerNodes.length) {
+      return [];
+    }
+
+    const nodeLead =
+      snapshot.nodes.filter((node) => node.owner === OWNER.AI).length - playerNodes.length;
+    const unitLead =
+      snapshotTotalUnits(snapshot, OWNER.AI) - snapshotTotalUnits(snapshot, OWNER.PLAYER);
+    const productionLead =
+      snapshotProduction(snapshot, OWNER.AI) - snapshotProduction(snapshot, OWNER.PLAYER);
+    if (nodeLead < 1 && unitLead < 8 && productionLead < 0.8) {
+      return [];
+    }
+
+    return playerNodes
+      .map((node) => {
+        const required = Math.max(1, attackNeed(snapshot, node) - AI_FINISH_OVERKILL);
+        return buildNodeTransferOrder(snapshot, OWNER.AI, "forced-finish", node, required, {
+          allowPartial: true,
+          scoreBias:
+            AI_FINISH_BIAS +
+            nodeLead * 18 +
+            Math.max(0, unitLead) * 2 +
+            productionLead * 20 -
+            required * 0.12,
+        });
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.scoreBias - a.scoreBias)
+      .slice(0, 3);
   }
 
   function generateSupplyCandidates(snapshot) {
@@ -2164,6 +2421,36 @@
       .slice(0, 4);
   }
 
+  function generateCompoundCandidates(snapshot) {
+    const compounds = [];
+    const stabilizers = generateStabilizeCandidates(snapshot).slice(0, 3);
+    const captures = generateExpansionCandidates(snapshot).slice(0, 3);
+    const attacks = generateAttackCandidates(snapshot).slice(0, 4);
+    const counterRaids = generateCounterRaidCandidates(snapshot).slice(0, 2);
+    const unitAdvantage =
+      snapshotTotalUnits(snapshot, OWNER.AI) - snapshotTotalUnits(snapshot, OWNER.PLAYER);
+    const nodeLead =
+      snapshot.nodes.filter((node) => node.owner === OWNER.AI).length -
+      snapshot.nodes.filter((node) => node.owner === OWNER.PLAYER).length;
+
+    captures.forEach((capture, index) => {
+      const stabilizer = stabilizers[index % Math.max(1, stabilizers.length)];
+      if (stabilizer) {
+        compounds.push(mergeOrders("secure-capture", [stabilizer, capture], 18));
+      }
+    });
+
+    if ((nodeLead >= 1 || unitAdvantage >= 12) && attacks.length >= 2) {
+      compounds.push(mergeOrders("finish-push", attacks.slice(0, 2), AI_FINISH_BIAS * 0.65));
+    }
+
+    if (counterRaids.length > 0 && attacks.length > 0) {
+      compounds.push(mergeOrders("counter-swing", [counterRaids[0], attacks[0]], 24));
+    }
+
+    return compounds.filter(Boolean).slice(0, 5);
+  }
+
   function generateProactiveCandidates(snapshot) {
     return [
       ...generateStabilizeCandidates(snapshot),
@@ -2175,6 +2462,51 @@
     ]
       .sort((a, b) => b.scoreBias - a.scoreBias)
       .slice(0, AI_MAX_CANDIDATES);
+  }
+
+  function orderCommittedFromNode(order, nodeId) {
+    return (order?.legs || []).reduce(
+      (sum, leg) => (leg.sourceId === nodeId ? sum + leg.count : sum),
+      0,
+    );
+  }
+
+  function orderCommittedToNode(order, nodeId) {
+    return (order?.legs || []).reduce((sum, leg) => {
+      if (leg.kind === "node" && leg.targetId === nodeId && !leg.invest) {
+        return sum + leg.count;
+      }
+      return sum;
+    }, 0);
+  }
+
+  function mergeOrders(type, orders, scoreBias = 0) {
+    const legs = orders.flatMap((order) => order.legs || []);
+    if (!legs.length) {
+      return null;
+    }
+
+    return {
+      type,
+      targetId: null,
+      required: legs.reduce((sum, leg) => sum + leg.count, 0),
+      committed: legs.reduce((sum, leg) => sum + leg.count, 0),
+      scoreBias:
+        scoreBias +
+        orders.reduce((sum, order) => sum + (order?.scoreBias || 0) * 0.25, 0),
+      legs,
+    };
+  }
+
+  function buildSmartOpponentResponse(snapshot, aiOrder) {
+    const defense = buildOpponentResponse(snapshot, aiOrder, "defend");
+    if (defense) {
+      return defense;
+    }
+
+    const raid = buildOpponentResponse(snapshot, aiOrder, "raid");
+    const expand = buildOpponentResponse(snapshot, aiOrder, "expand");
+    return mergeOrders("player-smart", [raid, expand].filter(Boolean));
   }
 
   function buildOpponentResponse(snapshot, aiOrder, policy) {
@@ -2218,6 +2550,76 @@
         allowPartial: true,
         scoreBias: 0,
       });
+    }
+
+    if (policy === "all-in") {
+      const target = snapshot.nodes
+        .filter((node) => node.owner === OWNER.AI)
+        .map((node) => {
+          const outgoing = orderCommittedFromNode(aiOrder, node.id);
+          const incoming = orderCommittedToNode(aiOrder, node.id);
+          const strength =
+            Math.max(0, stationedOn(node, OWNER.AI) - outgoing) +
+            node.hp +
+            incoming * 0.25 +
+            knownInboundTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.35);
+          const enemyEta = closestOwnerEta(snapshot, node, OWNER.PLAYER);
+          return {
+            node,
+            required: Math.max(1, Math.ceil(strength + 4)),
+            score:
+              strength * 1.8 +
+              enemyEta * 0.5 -
+              nodeStrategicValue(snapshot, node) * 0.06,
+          };
+        })
+        .sort((a, b) => a.score - b.score)[0];
+      if (!target) {
+        return null;
+      }
+
+      return buildNodeTransferOrder(snapshot, OWNER.PLAYER, "player-all-in", target.node, target.required, {
+        allowPartial: true,
+        scoreBias: 0,
+      });
+    }
+
+    if (policy === "raid") {
+      const target = snapshot.nodes
+        .filter((node) => node.owner === OWNER.AI)
+        .map((node) => {
+          const outgoing = orderCommittedFromNode(aiOrder, node.id);
+          const incoming = orderCommittedToNode(aiOrder, node.id);
+          const strength =
+            Math.max(0, stationedOn(node, OWNER.AI) - outgoing) +
+            node.hp +
+            incoming * 0.35 +
+            knownInboundTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.45);
+          const pressure = potentialThreatTo(snapshot, node, OWNER.AI, AI_HORIZON * 0.75);
+          const enemyEta = closestOwnerEta(snapshot, node, OWNER.PLAYER);
+          return {
+            node,
+            required: Math.max(1, Math.ceil(strength + 2)),
+            score:
+              strength * 2.2 +
+              enemyEta * 0.45 -
+              pressure * 0.75 -
+              nodeStrategicValue(snapshot, node) * 0.05,
+          };
+        })
+        .sort((a, b) => a.score - b.score)[0];
+      if (!target) {
+        return null;
+      }
+
+      return buildNodeTransferOrder(snapshot, OWNER.PLAYER, "player-raid", target.node, target.required, {
+        allowPartial: true,
+        scoreBias: 0,
+      });
+    }
+
+    if (policy === "smart") {
+      return buildSmartOpponentResponse(snapshot, aiOrder);
     }
 
     if (policy === "expand") {
@@ -2272,6 +2674,38 @@
     return sim.nodes.reduce((sum, node) => (node.owner === owner ? sum + node.hp : sum), 0);
   }
 
+  function simStrategicPressureLevel(sim, owner = OWNER.AI) {
+    const enemy = otherOwner(owner);
+    const ownedNodes = sim.nodes.filter((node) => node.owner === owner).length;
+    const enemyNodes = sim.nodes.filter((node) => node.owner === enemy).length;
+    const neutralNodes = sim.nodes.filter((node) => node.owner === OWNER.NEUTRAL).length;
+    const ownedUnits = Math.max(1, simTotalUnits(sim, owner));
+    const enemyUnits = simTotalUnits(sim, enemy);
+    const ownedProduction = Math.max(0.01, simProduction(sim, owner));
+    const enemyProduction = simProduction(sim, enemy);
+
+    let pressure = 0;
+    if (enemyNodes >= ownedNodes - 1) {
+      pressure += 1;
+    }
+    if (enemyUnits >= ownedUnits * 0.82) {
+      pressure += 1;
+    }
+    if (enemyProduction >= ownedProduction * 0.85) {
+      pressure += 1;
+    }
+    if (neutralNodes <= 2 && enemyNodes > 0) {
+      pressure += 1;
+    }
+
+    return pressure;
+  }
+
+  function simAdaptiveSafetyMargin(sim, owner = OWNER.AI) {
+    const pressure = simStrategicPressureLevel(sim, owner);
+    return AI_SAFETY_MARGIN + (pressure >= 3 ? 1 : 0);
+  }
+
   function simInfluenceAt(sim, target, owner) {
     const nodeInfluence = sim.nodes.reduce((sum, source) => {
       if (source.owner !== owner) {
@@ -2310,6 +2744,7 @@
     let nodeValue = 0;
     let influence = 0;
     let risk = 0;
+    const safetyMargin = simAdaptiveSafetyMargin(sim, OWNER.AI);
     sim.nodes.forEach((node) => {
       const value = nodeStrategicValue(sim, node);
       if (node.owner === OWNER.AI) {
@@ -2326,13 +2761,15 @@
 
       if (node.owner === OWNER.AI) {
         const margin = simStationed(sim, node.id, OWNER.AI) + node.hp - playerInfluence * 0.45;
-        if (margin < AI_SAFETY_MARGIN) {
-          risk += (AI_SAFETY_MARGIN - margin) * 12;
+        if (margin < safetyMargin) {
+          risk += (safetyMargin - margin) * 12;
         }
       }
     });
 
-    const production = (simProduction(sim, OWNER.AI) - simProduction(sim, OWNER.PLAYER)) * 260;
+    const aiProduction = simProduction(sim, OWNER.AI);
+    const playerProduction = simProduction(sim, OWNER.PLAYER);
+    const production = (aiProduction - playerProduction) * 290;
     const military =
       (simTotalUnits(sim, OWNER.AI) - simTotalUnits(sim, OWNER.PLAYER)) * 3.2 +
       (simHp(sim, OWNER.AI) - simHp(sim, OWNER.PLAYER)) * 1.15;
@@ -2340,15 +2777,106 @@
       return fleet.owner === OWNER.AI ? sum + (fleet.exposure || 0) * 8 : sum;
     }, 0);
 
-    return production + military + nodeValue * 5.5 + influence - risk - travelExposure;
+    const nodeLead = aiNodes.length - playerNodes.length;
+    const finishPressure =
+      nodeLead >= AI_DECISIVE_NODE_LEAD || aiProduction >= playerProduction * 1.45
+        ? Math.max(0, simTotalUnits(sim, OWNER.AI) - simTotalUnits(sim, OWNER.PLAYER)) * 1.4
+        : 0;
+
+    return production + military + nodeValue * 5.5 + influence + finishPressure - risk - travelExposure;
   }
 
-  function evaluateOrderRobustly(snapshot, order) {
-    const policies = ["none", "defend", "counter", "expand"];
+  function evaluateOrderRobustly(snapshot, order, options = {}) {
+    const policies = options.policies || ["none", "defend", "counter", "expand"];
     const scores = policies.map((policy) => scoreFuture(simulateFuture(snapshot, order, policy)));
     const worst = Math.min(...scores);
     const average = scores.reduce((sum, score) => sum + score, 0) / scores.length;
     return worst + average * 0.12 + (order?.scoreBias || 0);
+  }
+
+  function generateDecisionCandidates(snapshot) {
+    let candidates = generateProactiveCandidates(snapshot);
+    const unitAdvantage =
+      snapshotTotalUnits(snapshot, OWNER.AI) - snapshotTotalUnits(snapshot, OWNER.PLAYER);
+    if (unitAdvantage > AI_PRESSURE_ATTACK_GATE) {
+      const attacks = generateAttackCandidates(snapshot);
+      if (attacks.length > 0) {
+        candidates = [...attacks, ...candidates].slice(0, AI_MAX_CANDIDATES);
+      }
+    }
+
+    if (!candidates.length) {
+      const fallback = buildFallbackOrder(snapshot);
+      return fallback ? [fallback] : [];
+    }
+
+    return candidates;
+  }
+
+  function bestFollowupScore(snapshot) {
+    const baseline = evaluateOrderRobustly(snapshot, null);
+    const candidates = generateDecisionCandidates(snapshot)
+      .slice()
+      .sort((a, b) => b.scoreBias - a.scoreBias)
+      .slice(0, AI_PLAN_FOLLOWUP_CANDIDATES);
+    if (!candidates.length) {
+      return baseline;
+    }
+
+    return candidates.reduce(
+      (best, order) => Math.max(best, evaluateOrderRobustly(snapshot, order)),
+      baseline,
+    );
+  }
+
+  function evaluateOrderWithPlanning(snapshot, order, robustScore) {
+    if (!AI_PLAN_ENABLED || !order) {
+      return robustScore;
+    }
+    const plannedTypes = [
+      "capture",
+      "attack",
+      "counter-raid",
+      "fallback-attack",
+      "fallback-capture",
+      "secure",
+      "finish",
+      "forced",
+    ];
+    if (!plannedTypes.some((type) => order.type.includes(type))) {
+      return robustScore;
+    }
+
+    const policies = ["none", "defend", "counter", "raid", "all-in", "expand", "smart"];
+    const horizon = Math.max(8, AI_HORIZON * 0.55);
+    const followupLifts = policies.map((policy) => {
+      const future = snapshotFromSim(simulateFuture(snapshot, order, policy, horizon));
+      const futureBaseline = evaluateOrderRobustly(future, null);
+      return bestFollowupScore(future) - futureBaseline;
+    });
+    const worstLift = Math.min(...followupLifts);
+    const averageLift =
+      followupLifts.reduce((sum, score) => sum + score, 0) / followupLifts.length;
+
+    return robustScore + (worstLift + averageLift * 0.35) * AI_PLAN_FOLLOWUP_WEIGHT;
+  }
+
+  function rankOrders(snapshot, candidates, options = {}) {
+    const ranked = candidates
+      .map((order) => ({
+        order,
+        score: evaluateOrderRobustly(snapshot, order, options),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    if (!AI_PLAN_ENABLED || options.planning === false) {
+      return ranked;
+    }
+
+    ranked.slice(0, AI_PLAN_TOP_CANDIDATES).forEach((entry) => {
+      entry.score = evaluateOrderWithPlanning(snapshot, entry.order, entry.score);
+    });
+    return ranked.sort((a, b) => b.score - a.score);
   }
 
   function buildFallbackOrder(snapshot) {
@@ -2418,9 +2946,8 @@
     });
   }
 
-  function selectRankedOrders(snapshot, ranked, limit, baseline) {
+  function selectRankedOrders(snapshot, ranked, limit, baseline, reserved = new Map()) {
     const selected = [];
-    const reserved = new Map();
     for (const entry of ranked) {
       if (selected.length >= limit) {
         break;
@@ -2443,12 +2970,7 @@
   function chooseAiOrders(snapshot) {
     const baseline = evaluateOrderRobustly(snapshot, null);
     const defenseCandidates = generateDefenseCandidates(snapshot);
-    const rankedDefense = defenseCandidates
-      .map((order) => ({
-        order,
-        score: evaluateOrderRobustly(snapshot, order),
-      }))
-      .sort((a, b) => b.score - a.score);
+    const rankedDefense = rankOrders(snapshot, defenseCandidates);
     if (rankedDefense.length > 0) {
       return selectRankedOrders(
         snapshot,
@@ -2458,27 +2980,14 @@
       );
     }
 
-    let candidates = generateProactiveCandidates(snapshot);
-    const unitAdvantage =
-      snapshotTotalUnits(snapshot, OWNER.AI) - snapshotTotalUnits(snapshot, OWNER.PLAYER);
-    if (unitAdvantage > AI_PRESSURE_ATTACK_GATE) {
-      const attacks = generateAttackCandidates(snapshot);
-      if (attacks.length > 0) {
-        candidates = [...attacks, ...candidates].slice(0, AI_MAX_CANDIDATES);
-      }
-    }
+    const candidates = generateDecisionCandidates(snapshot);
 
     if (!candidates.length) {
       const fallback = buildFallbackOrder(snapshot);
       return fallback ? [fallback] : [];
     }
 
-    const ranked = candidates
-      .map((order) => ({
-        order,
-        score: evaluateOrderRobustly(snapshot, order),
-      }))
-      .sort((a, b) => b.score - a.score);
+    const ranked = rankOrders(snapshot, candidates);
     const selected = selectRankedOrders(snapshot, ranked, AI_MAX_ORDERS, baseline);
     if (selected.length > 0) {
       return selected;
@@ -2531,15 +3040,16 @@
     }
 
     state.ai.elapsed += dt;
-    if (state.ai.elapsed < AI_DECISION_INTERVAL) {
-      return;
-    }
-    state.ai.elapsed = 0;
+    let batches = 0;
+    while (state.ai.elapsed >= AI_DECISION_INTERVAL && batches < 8) {
+      state.ai.elapsed -= AI_DECISION_INTERVAL;
+      batches += 1;
 
-    const snapshot = snapshotState();
-    const orders = chooseAiOrders(snapshot);
-    if (orders.length > 0) {
-      executeAiOrders(orders);
+      const snapshot = snapshotState();
+      const orders = chooseAiOrders(snapshot);
+      if (orders.length > 0) {
+        executeAiOrders(orders);
+      }
     }
   }
 
